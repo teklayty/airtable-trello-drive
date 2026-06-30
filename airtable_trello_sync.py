@@ -4,6 +4,10 @@ import requests
 from datetime import datetime, timedelta, timezone
 from dateutil.parser import parse as parse_iso
 import logging
+import urllib.parse
+import json
+import base64
+
 
 # =========================================================
 # CONFIG
@@ -30,6 +34,20 @@ AUTH = {"key": TRELLO_API_KEY, "token": TRELLO_API_TOKEN}
 
 AIRTABLE_HEADERS = {"Authorization": f"Bearer {AIRTABLE_TOKEN}"}
 
+# =========================================================
+# NEW SETUP AFTER AIRTABLE CHANGES for CoSS/SCC/CAS Notes
+# =========================================================
+AIRTABLE_NOTES_PAGE_ID = os.getenv(
+    "AIRTABLE_NOTES_PAGE_ID",
+    "pagLsUMtGqYgvu2a5"
+)
+
+AIRTABLE_NOTES_PARAM = os.getenv(
+    "AIRTABLE_NOTES_PARAM",
+    "Pwx3z"
+)
+
+
 TODAY = datetime.now()
 RECENT_ARCHIVE_DAYS = 10
 TWO_MONTHS_AGO = TODAY - timedelta(days=60)
@@ -46,7 +64,7 @@ CLEANUP_LIST_ID = os.getenv("TRELLO_CLEANUP_LIST_ID")
 # =========================================================
 
 logging.basicConfig(
-    filename="../Airtable2Trello/sync.log",
+    filename="/home/springvolunteer/Airtable2Trello/sync.log",
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S"
@@ -65,6 +83,9 @@ def log(msg, level="info"):
 # HELPERS
 # =========================================================
 
+def encode_airtable_id(record_id):
+    return base64.urlsafe_b64encode(record_id.encode()).decode()
+
 def parse_date(value):
     if not value:
         return None
@@ -76,14 +97,26 @@ def parse_date(value):
             continue
     return None
 
-def extract_airtable_id(value):
+def extract_airtable_id_from_card(value):
+    print("=" * 60)
+    print(f"DEBUG: Raw input: {value}")
+    
     if not value:
+        print("DEBUG: Value is empty or None")
         return ""
+    
+    value = str(value)
+    print(f"DEBUG: Cast to string: {value}")
+    
     match = re.search(r"(rec[a-zA-Z0-9]{14})", value)
-    return match.group(1) if match else ""
-
-def extract_airtable_id_from_card(card):
-    return extract_airtable_id(card.get("desc", ""))
+    
+    if match:
+        airtable_id = match.group(1)
+        print(f"DEBUG: Match found: {airtable_id}")
+        return airtable_id
+    else:
+        print("DEBUG: No match found")
+        return ""
 
 def get_field(fields, key):
     value = fields.get(key, "")
@@ -99,6 +132,13 @@ def clean_phone(phone):
         return f"44{digits[1:]}"
     return f"44{digits}"
 
+def build_notes_link(record_id):
+    return (
+        f"https://airtable.com/"
+        f"{AIRTABLE_BASE_ID}/"
+        f"{AIRTABLE_NOTES_PAGE_ID}"
+        f"?{AIRTABLE_NOTES_PARAM}={record_id}"
+    )
 def build_airtable_link(record_id):
     return f"https://airtable.com/{AIRTABLE_BASE_ID}/{AIRTABLE_TABLE_ID}/{AIRTABLE_VIEW_ID}/{record_id}?blocks=hide"
 
@@ -118,6 +158,30 @@ def calculate_card_position(eviction_date):
     days_until = (eviction_date - TODAY).days
     return max(days_until, 0)
 
+
+def generate_notes_anchor_link(record_id):
+    return build_notes_link(record_id)
+
+
+
+# notes_link = build_notes_link(record_id)
+
+
+def generate_interface_link(record_id):
+    base_url = "https://airtable.com/appt4PI9krGalheLk/pagLsUMtGqYgvu2a5"
+
+    detail = {
+        "pageId": "pagB5URnGwh70uwTB",
+        "rowId": record_id,
+        "showComments": False
+    }
+
+    encoded = urllib.parse.quote(json.dumps(detail))
+
+    return f"{base_url}?detail={encoded}"
+
+
+
 # =========================================================
 # Airtable Comments API Function
 # =========================================================
@@ -133,6 +197,38 @@ def get_airtable_comments(record_id):
 
     data = r.json()
     return data.get("comments", [])
+
+
+# =========================================================
+# Airtable NOTES LINKS ON Comments
+# =========================================================
+def build_notes_link(record_id):
+    return (
+        f"https://airtable.com/"
+        f"{AIRTABLE_BASE_ID}/"
+        f"{AIRTABLE_NOTES_PAGE_ID}"
+        f"?{AIRTABLE_NOTES_PARAM}={record_id}"
+    )
+
+
+# =========================================================
+# Open CoSS Support for client
+# ========================================================= 
+def build_prefill_form_link(fullname, airtable_id):
+    base_url = (
+        "https://airtable.com/"
+        "appt4PI9krGalheLk/"
+        "pag30p3pX8fc0lFkn/form"
+    )
+
+    value = f"{fullname} ({airtable_id})"
+    encoded_value = urllib.parse.quote(value)
+
+    return (
+        f"{base_url}"
+        f"?prefill_Client%20ID%20and%20Full%20Name={encoded_value}"
+    )
+
 
 # =========================================================
 # Format Comments Nicely
@@ -201,56 +297,94 @@ def delete_all_comments(card_id):
         except Exception as e:
             log(f"Could not delete comment: {e}", "error")
 
-
-def format_notes(notes):
-    """
-    Format notes into a bulleted list (single string).
-    """
-    if not notes:
-        return ""
-
-    entries = [
-        n.strip()
-        for n in str(notes).splitlines()
-        if n.strip()
-    ]
-
-    # Convert to bullet points
-    return "\n".join([f"• {entry}" for entry in entries]) + "\n"
-
-
-def sync_airtable_comment(
+def add_comment(
     card_id,
+    record_id,
+    last_modified,
     coss_notes,
     scc_notes,
     cas_notes,
-    last_modified
+    gdrive,
+    fullname
 ):
     delete_all_comments(card_id)
 
-    sections = []
+    notes_link = build_notes_link(record_id)
+    form_link = build_prefill_form_link(fullname, record_id)
 
-    def add_section(title, notes, emoji):
-        formatted = format_notes(notes)
+    lines = [
+        f"📌 Last updated: {last_modified}",
+        "",
+        "🔒 Notes stored in Airtable:",
+        ""
+    ]
 
-        if formatted:
-            sections.append(f"## {emoji} {title}\n{formatted}")
+    if coss_notes and str(coss_notes).strip():
+        lines.append(f"🟦 CoSS Notes:\n{notes_link}\n")
 
-    # ✅ Use different colours
-    add_section("CoSS Notes", coss_notes, "🟦")
-    add_section("SCC Notes", scc_notes, "🟨")
-    add_section("CAS Notes", cas_notes, "🟩")
+    if scc_notes and str(scc_notes).strip():
+        lines.append(f"🟨 SCC Notes:\n{notes_link}\n")
 
-    if sections:
-        comment_text = (
-            f"📌 **Last updated:** {last_modified}\n\n---\n\n"
-            + "\n\n---\n\n".join(sections)
-        )
+    if cas_notes and str(cas_notes).strip():
+        lines.append(f"🟩 CAS Notes:\n{notes_link}\n")
 
-        trello_post(
-            f"/cards/{card_id}/actions/comments",
-            {"text": comment_text}
-        )
+    if gdrive and str(gdrive).strip():
+        lines.extend([
+            "",
+            "📁 Google Drive:",
+            gdrive
+        ])
+
+    lines.extend([
+        "",
+        "📝 CoSS Support Form:",
+        form_link
+    ])
+
+    comment_text = "\n".join(lines)
+
+    trello_post(
+        f"/cards/{card_id}/actions/comments",
+        {"text": comment_text}
+    )
+
+
+
+def generate_note_links(record_id, coss_notes, scc_notes, cas_notes):
+    notes_link = build_notes_link(record_id)
+
+    links = []
+
+    if coss_notes and str(coss_notes).strip():
+        links.append(("🟦 CoSS Notes", notes_link))
+
+    if scc_notes and str(scc_notes).strip():
+        links.append(("🟨 SCC Notes", notes_link))
+
+    if cas_notes and str(cas_notes).strip():
+        links.append(("🟩 CAS Notes", notes_link))
+
+    return links
+
+
+def generate_section_links(record_id):
+    notes_link = build_notes_link(record_id)
+
+    return {
+        "coss": notes_link,
+        "scc": notes_link,
+        "cas": notes_link
+    }
+
+
+
+# =========================================================
+# ADD ATTACHMENTS
+# =========================================================    
+def add_attachments(card_id, record_id, fullname, gdrive):
+    delete_system_attachments(card_id)
+    return
+
 
 
 # =========================================================
@@ -275,26 +409,28 @@ def airtable_get_all_records():
             break
     return records
 
-
 # =========================================================
 # MOVE TO URGENT LIST
 # =========================================================
 
 def extract_phone_from_card(card):
-    """
-    Extract any phone number-like sequence and normalize it.
-    """
-    text = (card.get("name", "") + " " + card.get("desc", ""))
+    text = card.get("name", "") + " " + card.get("desc", "")
 
-    # Find any long digit sequence (phone-like)
-    matches = re.findall(r"[\+()0-9\s\-]{10,}", text)
+    # log(f"Current Airtable phone: {phone}")
+    # log(f"Checking against index: {list(phone_index.keys())}")
+
+
+    # Look for UK numbers more strictly
+    matches = re.findall(r"(?:\+44|0)\s?\d[\d\s\-()]{8,}", text)
 
     for match in matches:
         cleaned = clean_phone(match)
-        if len(cleaned) >= 11:  # basic sanity check
+
+        if len(cleaned) >= 11:
             return cleaned
 
     return ""
+
 
 
 # =========================================================
@@ -336,11 +472,15 @@ def load_existing_cards():
             # ✅ Build PHONE INDEX (for duplicate detection)
             # =====================================================
             phone = extract_phone_from_card(card)
+            log(f"Extracted phone from card '{card.get('name')}': {phone}")
+
 
             if phone:
                 if phone not in phone_index:
                     phone_index[phone] = []
                 phone_index[phone].append(card)
+
+            log(f"📞 Phone index built: { {k: len(v) for k,v in phone_index.items()} }")
 
             # =====================================================
             # ✅ Existing Airtable ID logic (unchanged)
@@ -387,6 +527,79 @@ def clean_card(card_id):
     for cl in trello_get(f"/cards/{card_id}/checklists"):
         trello_delete(f"/checklists/{cl['id']}")
     trello_put(f"/cards/{card_id}", {"desc": ""})
+
+def phone_matches(p1, p2):
+    if not p1 or not p2:
+        return False
+    return p1[-9:] == p2[-9:]
+
+
+def delete_system_attachments(card_id):
+    attachments = trello_get(f"/cards/{card_id}/attachments")
+
+    for att in attachments:
+        name = att.get("name", "")
+
+        # ✅ Only delete attachments created by your system
+        if any(keyword in name for keyword in [
+            "Airtable Record",
+            "Google Drive",
+            "CoSS Notes",
+            "SCC Notes",
+            "CAS Notes",
+            "CoSS Support Form"
+        ]):
+            try:
+                trello_delete(f"/cards/{card_id}/attachments/{att['id']}")
+            except Exception as e:
+                log(f"Could not delete attachment: {e}", "error")
+# =========================================================
+# MARK AND MOVE TO CLEANUP
+# =========================================================
+def mark_and_move_to_cleanup(card):
+    card_id = card["id"]
+
+    log(f"🧹 Marking as 'Delete Me': {card.get('name')}")
+
+    labels = trello_get(f"/cards/{card_id}/labels")
+
+    # ✅ Add "Delete Me!" label if missing
+    if not any(lbl.get("name") == "Delete Me!" for lbl in labels):
+        trello_post(
+            f"/cards/{card_id}/labels",
+            {"name": "Duplicate,Delete Me!", "color": "black"}
+        )
+
+    # ✅ OPTIONAL: move to cleanup list (keep this if you want movement)
+    if CLEANUP_LIST_ID and card.get("idList") != CLEANUP_LIST_ID:
+        trello_put(
+            f"/cards/{card_id}",
+            {"idList": CLEANUP_LIST_ID}
+        )
+
+
+# =========================================================
+# NORMALIZE UK PHONE
+# =========================================================
+def clean_phone(phone):
+    if not phone:
+        return ""
+
+    digits = re.sub(r"\D", "", str(phone))
+
+    if digits.startswith("00"):
+        digits = digits[2:]
+
+    if digits.startswith("44"):
+        return digits
+
+    if digits.startswith("0"):
+        return "44" + digits[1:]
+
+    if len(digits) >= 10:
+        return "44" + digits[-10:]
+
+    return digits
 
 # =========================================================
 # MAIN
@@ -467,17 +680,20 @@ for record in records:
         cas_notes = get_field(fields, "CAS Notes")
         last_modified = get_field(fields, "Last modified")
         # f"CoSS Support Provided (1y):\n{coss_support_1y}\n\n"
+        # encoded_id = encode_airtable_id(airtable_id)
+        # desc = (
+        #     f"ID:{encoded_id}\n\n"
         desc = (
-            f"AIRTABLE_RECORD_ID:\n{airtable_id}\n\n"
             f"WhatsApp Web:\nhttps://web.whatsapp.com/send?phone={whatsapp_number}\n\n"
             f"WhatsApp Phone:\nhttps://wa.me/{whatsapp_number}\n\n"
             f"SPRING - Issue:\n{spring_issue}\n\n"
             f"CoSS Support Provided:\n{coss_support}\n\n"
             f"Supporting Documents attached:\n{supporting_docs}\n\n"
-            f"Airtable Link:\n{airtable_link}\n\n"
-            f"Google Drive:\n{gdrive}\n\n"
-            f"==================================\n"
-            f"Coss Support Form\nhttps://airtable.com/appt4PI9krGalheLk/shrNKwiG0B0uYnWlD"
+            f"'':{airtable_id}\n\n"
+            # f"Airtable Link:\n{airtable_link}\n\n"
+            # f"Google Drive:\n{gdrive}\n\n"
+            # f"==================================\n"
+            # f"Coss Support Form\nhttps://airtable.com/appt4PI9krGalheLk/shrNKwiG0B0uYnWlD"
         )
 
         if airtable_id in existing_cards:
@@ -508,15 +724,44 @@ for record in records:
             existing_cards[airtable_id] = {"card": card, "closed": False}
             created += 1
 
-        # Add comments
-        sync_airtable_comment(
+        # =========================================================
+        # Remove attachments
+        # =========================================================
+
+        attachments = trello_get(f"/cards/{card_id}/attachments")
+
+        for att in attachments:
+            trello_delete(f"/cards/{card_id}/attachments/{att['id']}")
+
+
+        # ✅ Add secure Airtable link instead of raw notes
+        add_comment(
             card_id,
+            airtable_id,
+            last_modified,
             coss_notes,
             scc_notes,
             cas_notes,
-            last_modified
+            gdrive,
+            fullname
         )
 
+        # add_attachments(
+        #     card_id,
+        #     airtable_id,
+        #     fullname,
+        #     gdrive,
+        # )
+
+
+
+        # =========================================================
+        # ✅ ADD PREFILLED FORM LINK AS COMMENT
+        # =========================================================
+
+        form_link = build_prefill_form_link(fullname, airtable_id)
+
+        
         # =========================================================
         # LABELS (preserve staff labels)
         # =========================================================
@@ -535,12 +780,12 @@ for record in records:
                 trello_delete(f"/cards/{card_id}/idLabels/{lbl['id']}")
 
         # ✅ Add updated status label
-        if "Urgent" in status:
-            trello_post(f"/cards/{card_id}/labels", {"color": "red"})
-        elif "Pending" in status:
-            trello_post(f"/cards/{card_id}/labels", {"color": "yellow"})
-        else:
-            trello_post(f"/cards/{card_id}/labels", {"color": "green"})
+        # if "Urgent" in status:
+        #     trello_post(f"/cards/{card_id}/labels", {"color": "red"})
+        # elif "Pending" in status:
+        #     trello_post(f"/cards/{card_id}/labels", {"color": "yellow"})
+        # else:
+        #     trello_post(f"/cards/{card_id}/labels", {"color": "green"})
 
         # =========================================================
         # MOVE TO URGENT LIST
@@ -554,6 +799,38 @@ for record in records:
             else:
                 log(f"ℹ️ Card NOT moved (not in CREATE_LIST_ID): {card_name}")
 
+        # =========================================================
+        # ✅ DUPLICATE CHECK (MOVE THIS INTO YOUR MAIN LOOP)
+        # =========================================================
+        # ⚠️ IMPORTANT: this block MUST run INSIDE your Airtable loop
+
+        phone = clean_phone(contact_phone)
+
+        if phone:
+            for stored_phone, cards_list in phone_index.items():
+
+                if not stored_phone:
+                    continue
+
+                if phone_matches(phone, stored_phone):
+
+                    for other_card in cards_list:
+                        other_id = other_card["id"]
+
+                        # ✅ skip same card
+                        if other_id == card_id:
+                            continue
+
+                        other_airtable_id = extract_airtable_id_from_card(other_card)
+
+                        # ✅ ONLY manual cards (no Airtable ID)
+                        if not other_airtable_id:
+                            log(f"⚠️ Manual duplicate detected: {other_card['name']}")
+                            mark_and_move_to_cleanup(other_card)
+
+
+
+
 
     except Exception as e:
         log(f"❌ Error processing {airtable_id}: {e}", "error")
@@ -562,104 +839,8 @@ log(f"\n✅ Complete. Cards created: {created}, updated: {updated}")
 
 
 
-def phone_matches(p1, p2):
-    """
-    Compare phone numbers by last 9 digits (UK safe match).
-    """
-    return p1[-9:] == p2[-9:]
-
-# =========================================================
-# MARK AND MOVE TO CLEANUP
-# =========================================================
-def mark_and_move_to_cleanup(card):
-    card_id = card["id"]
-
-    log(f"🧹 Moving to cleanup: {card.get('name')}")
-
-    # ✅ Add "Delete Me!" label if not already present
-    labels = trello_get(f"/cards/{card_id}/labels")
-
-    label_exists = any(lbl.get("name") == "Delete Me!" for lbl in labels)
-
-    if not label_exists:
-        trello_post(
-            f"/cards/{card_id}/labels",
-            {"name": "Delete Me!", "color": "black"}
-        )
-
-    # ✅ Move to cleanup list (only if not already there)
-    if card.get("idList") != CLEANUP_LIST_ID:
-        trello_put(
-            f"/cards/{card_id}",
-            {"idList": CLEANUP_LIST_ID}
-        )
-
-# =========================================================
-# NORMALIZE UK PHONE
-# =========================================================
-def clean_phone(phone):
-    """
-    Normalize UK phone numbers into consistent format:
-    447XXXXXXXXX
-    """
-
-    if not phone:
-        return ""
-
-    # Remove everything except digits
-    digits = re.sub(r"\D", "", str(phone))
-
-    # Remove leading zeros beyond one
-    digits = digits.lstrip("0")
-
-    # Handle UK formats
-    if digits.startswith("44"):
-        return digits
-
-    # If it was originally starting with 0
-    if str(phone).strip().startswith("0"):
-        return "44" + digits
-
-    # Fallback: assume UK number missing 0
-    if len(digits) <= 10:
-        return "44" + digits
-
-    return digits
-
-# =========================================================
-# EXTRACT PHONE FROM CARD
-# =========================================================
-def extract_phone_from_card(card):
-    """
-    Extract any phone number-like sequence and normalize it.
-    """
-    text = (card.get("name", "") + " " + card.get("desc", ""))
-
-    # Find any long digit sequence (phone-like)
-    matches = re.findall(r"[\+()0-9\s\-]{10,}", text)
-
-    for match in matches:
-        cleaned = clean_phone(match)
-        if len(cleaned) >= 11:  # basic sanity check
-            return cleaned
-
-    return ""
 
 
-current_phone = clean_phone(contact_phone)
 
-for stored_phone, cards_list in phone_index.items():
-    if phone_matches(current_phone, stored_phone):
 
-        for other_card in cards_list:
-            other_id = other_card["id"]
-
-            if other_id == card_id:
-                continue
-
-            other_airtable_id = extract_airtable_id_from_card(other_card)
-
-            if not other_airtable_id:
-                log(f"⚠️ Manual duplicate detected: {other_card['name']}")
-                mark_and_move_to_cleanup(other_card)
 
