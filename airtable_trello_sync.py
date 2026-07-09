@@ -180,6 +180,49 @@ def generate_interface_link(record_id):
 
     return f"{base_url}?detail={encoded}"
 
+# =========================================================
+# LABELING CARDS IF NO REFERRAL TO COUNCIL
+# =========================================================
+def ensure_referral_label(card_id, referral_requested_date):
+    labels = trello_get(f"/cards/{card_id}/labels")
+
+    referral_label = None
+
+    for lbl in labels:
+        if lbl.get("name") == "No Referral made to SCC":
+            referral_label = lbl
+            break
+
+    value = str(referral_requested_date).strip().lower()
+
+    has_referral = value not in {
+        "",
+        "none",
+        "null",
+        "[]"
+    }
+
+    log(
+        f"DEBUG referral value='{value}' "
+        f"has_referral={has_referral}"
+    )
+
+    if not has_referral:
+        if not referral_label:
+            trello_post(
+                f"/cards/{card_id}/labels",
+                {
+                    "name": "No Referral made to SCC",
+                    "color": "orange"
+                }
+            )
+
+    else:
+        if referral_label:
+            trello_delete(
+                f"/cards/{card_id}/idLabels/{referral_label['id']}"
+            )
+
 
 
 # =========================================================
@@ -679,10 +722,24 @@ for record in records:
         scc_notes = get_field(fields, "SCC Notes")
         cas_notes = get_field(fields, "CAS Notes")
         last_modified = get_field(fields, "Last modified")
-        # f"CoSS Support Provided (1y):\n{coss_support_1y}\n\n"
-        # encoded_id = encode_airtable_id(airtable_id)
-        # desc = (
-        #     f"ID:{encoded_id}\n\n"
+        referral_requested_date = get_field(
+            fields,
+            "SCC - Referral requested (date)."
+        )
+
+        # Using PHONE to detect duplications
+        ia_phone = whatsapp_phone
+
+        ia_clean = clean_phone(ia_phone)
+        wa_clean = clean_phone(whatsapp_phone)
+
+        print(f"IA: {ia_phone} -> {ia_clean}")
+        print(f"WA: {whatsapp_phone} -> {wa_clean}")
+        print(f"Match: {ia_clean == wa_clean}")
+
+
+
+
         desc = (
             f"WhatsApp Web:\nhttps://web.whatsapp.com/send?phone={whatsapp_number}\n\n"
             f"WhatsApp Phone:\nhttps://wa.me/{whatsapp_number}\n\n"
@@ -746,12 +803,19 @@ for record in records:
             fullname
         )
 
-        # add_attachments(
-        #     card_id,
-        #     airtable_id,
-        #     fullname,
-        #     gdrive,
-        # )
+        log(
+            f"DEBUG: {fullname} | SCC referral date = {repr(referral_requested_date)}"
+        )
+
+        ensure_referral_label(
+            card_id,
+            referral_requested_date
+        )
+
+
+        for key in fields.keys():
+            if "SCC" in key:
+                log(f"SCC FIELD: {key} = {fields[key]}")
 
 
 
@@ -778,14 +842,6 @@ for record in records:
         for lbl in existing_labels:
             if lbl.get("color") in status_colours:
                 trello_delete(f"/cards/{card_id}/idLabels/{lbl['id']}")
-
-        # ✅ Add updated status label
-        # if "Urgent" in status:
-        #     trello_post(f"/cards/{card_id}/labels", {"color": "red"})
-        # elif "Pending" in status:
-        #     trello_post(f"/cards/{card_id}/labels", {"color": "yellow"})
-        # else:
-        #     trello_post(f"/cards/{card_id}/labels", {"color": "green"})
 
         # =========================================================
         # MOVE TO URGENT LIST
