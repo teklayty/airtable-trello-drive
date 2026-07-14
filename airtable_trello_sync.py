@@ -747,11 +747,7 @@ for record in records:
             f"CoSS Support Provided:\n{coss_support}\n\n"
             f"Supporting Documents attached:\n{supporting_docs}\n\n"
             f"'':{airtable_id}\n\n"
-            # f"Airtable Link:\n{airtable_link}\n\n"
-            # f"Google Drive:\n{gdrive}\n\n"
-            # f"==================================\n"
-            # f"Coss Support Form\nhttps://airtable.com/appt4PI9krGalheLk/shrNKwiG0B0uYnWlD"
-        )
+            )
 
         if airtable_id in existing_cards:
             existing = existing_cards[airtable_id]

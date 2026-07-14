@@ -4,6 +4,7 @@ import requests
 from datetime import datetime, timedelta
 from dateutil.parser import parse as parse_iso
 import logging
+import urllib.parse
 
 # =========================================================
 # CONFIG
@@ -24,6 +25,19 @@ AIRTABLE_HEADERS = {"Authorization": f"Bearer {AIRTABLE_TOKEN}"}
 
 EXISTING_LIST_IDS = [lid.strip() for lid in EXISTING_LIST_IDS.split(",") if lid.strip()]
 TODAY = datetime.now()
+
+# =========================================================
+# NEW SETUP AFTER AIRTABLE CHANGES for CoSS/SCC/CAS Notes
+# =========================================================
+AIRTABLE_NOTES_PAGE_ID = os.getenv(
+    "AIRTABLE_NOTES_PAGE_ID",
+    "pagLsUMtGqYgvu2a5"
+)
+
+AIRTABLE_NOTES_PARAM = os.getenv(
+    "AIRTABLE_NOTES_PARAM",
+    "Pwx3z"
+)
 
 # =========================================================
 # LOGGING SETUP
@@ -71,6 +85,35 @@ def clean_phone(phone):
 def build_airtable_link(record_id):
     return f"https://airtable.com/{AIRTABLE_BASE_ID}/{AIRTABLE_TABLE_ID}/{AIRTABLE_VIEW_ID}/{record_id}?blocks=hide"
 
+# =========================================================
+# Airtable NOTES LINKS ON Comments
+# =========================================================
+def build_notes_link(record_id):
+    return (
+        f"https://airtable.com/"
+        f"{AIRTABLE_BASE_ID}/"
+        f"{AIRTABLE_NOTES_PAGE_ID}"
+        f"?{AIRTABLE_NOTES_PARAM}={record_id}"
+    )
+
+# =========================================================
+# Open CoSS Support for client
+# ========================================================= 
+def build_prefill_form_link(fullname, airtable_id):
+    base_url = (
+        "https://airtable.com/"
+        "appt4PI9krGalheLk/"
+        "pag30p3pX8fc0lFkn/form"
+    )
+
+    value = f"{fullname} ({airtable_id})"
+    encoded_value = urllib.parse.quote(value)
+
+    return (
+        f"{base_url}"
+        f"?prefill_Client%20ID%20and%20Full%20Name={encoded_value}"
+    )
+
 def calculate_card_position(eviction_date):
     if not eviction_date:
         return 999999999
@@ -107,6 +150,140 @@ def airtable_get_record(record_id):
     return r.json()
 
 # =========================================================
+# COMMENTS
+# =========================================================
+
+def delete_all_comments(card_id):
+    actions = trello_get(f"/cards/{card_id}/actions", {"filter": "commentCard"})
+    for action in actions:
+        try:
+            trello_delete(f"/actions/{action.get('id')}")
+        except Exception as e:
+            log(f"Could not delete comment: {e}", "error")
+
+
+def add_comment(
+    card_id,
+    record_id,
+    last_modified,
+    coss_notes,
+    scc_notes,
+    cas_notes,
+    gdrive,
+    fullname
+):
+    delete_all_comments(card_id)
+
+    notes_link = build_notes_link(record_id)
+    form_link = build_prefill_form_link(fullname, record_id)
+
+    lines = [
+        f"📌 Last updated: {last_modified}",
+        "",
+        "🔒 Notes stored in Airtable:",
+        ""
+    ]
+
+    if coss_notes and str(coss_notes).strip():
+        lines.append(f"🟦 CoSS Notes:\n{notes_link}\n")
+
+    if scc_notes and str(scc_notes).strip():
+        lines.append(f"🟨 SCC Notes:\n{notes_link}\n")
+
+    if cas_notes and str(cas_notes).strip():
+        lines.append(f"🟩 CAS Notes:\n{notes_link}\n")
+
+    if gdrive and str(gdrive).strip():
+        lines.extend([
+            "",
+            "📁 Google Drive:",
+            gdrive
+        ])
+
+    lines.extend([
+        "",
+        "📝 CoSS Support Form:",
+        form_link
+    ])
+
+    comment_text = "\n".join(lines)
+
+    trello_post(
+        f"/cards/{card_id}/actions/comments",
+        {"text": comment_text}
+    )
+
+# =========================================================
+# TRELLO API
+# =========================================================
+
+def trello_get(path, extra_params=None):
+    params = dict(AUTH)
+    if extra_params:
+        params.update(extra_params)
+    r = requests.get(f"{BASE_URL}{path}", params=params)
+    r.raise_for_status()
+    return r.json()
+
+def trello_post(path, data):
+    r = requests.post(f"{BASE_URL}{path}", params=AUTH, data=data)
+    r.raise_for_status()
+    return r.json()
+
+def trello_put(path, data):
+    r = requests.put(f"{BASE_URL}{path}", params=AUTH, data=data)
+    r.raise_for_status()
+    return r.json()
+
+def trello_delete(path):
+    r = requests.delete(f"{BASE_URL}{path}", params=AUTH)
+    r.raise_for_status()
+
+# =========================================================
+# LABELING CARDS IF NO REFERRAL TO COUNCIL
+# =========================================================
+def ensure_referral_label(card_id, referral_requested_date):
+    labels = trello_get(f"/cards/{card_id}/labels")
+
+    referral_label = None
+
+    for lbl in labels:
+        if lbl.get("name") == "No Referral made to SCC":
+            referral_label = lbl
+            break
+
+    value = str(referral_requested_date).strip().lower()
+
+    has_referral = value not in {
+        "",
+        "none",
+        "null",
+        "[]"
+    }
+
+    log(
+        f"DEBUG referral value='{value}' "
+        f"has_referral={has_referral}"
+    )
+
+    if not has_referral:
+        if not referral_label:
+            trello_post(
+                f"/cards/{card_id}/labels",
+                {
+                    "name": "No Referral made to SCC",
+                    "color": "orange"
+                }
+            )
+
+    else:
+        if referral_label:
+            trello_delete(
+                f"/cards/{card_id}/idLabels/{referral_label['id']}"
+            )
+
+
+# =========================================================
 # CREATE TRELLO CARD FROM AIRTABLE ID
 # =========================================================
 
@@ -114,90 +291,191 @@ def create_card_from_airtable(record_id, target_list_id):
     record = airtable_get_record(record_id)
     fields = record.get("fields", {})
 
-    # Full name
+    # =========================================================
+    # BASIC DETAILS
+    # =========================================================
+
     first = get_field(fields, "Forename/First name(s)")
     last = get_field(fields, "Surname/Last Name(s)")
     fullname = f"{first} {last}".strip()
+
     if not fullname:
-        log("❌ Missing full name, cannot create card")
+        log("❌ Missing full name")
         return
 
-    # Phone numbers
-    contact_number = get_field(fields, "Contact number")
-    whatsapp_number = get_field(fields, "WhatsApp number") or contact_number
-    if not contact_number:
-        log("❌ Missing contact number, cannot create card")
-        return
-    whatsapp_number_clean = clean_phone(whatsapp_number)
+    contact_phone = get_field(fields, "Contact number")
+    whatsapp_phone = get_field(fields, "WhatsApp number") or contact_phone
 
-    # Eviction date & Google Drive link
+    if not contact_phone and not whatsapp_phone:
+        log("❌ Missing phone number")
+        return
+
+    whatsapp_number = clean_phone(whatsapp_phone)
+
     eviction_raw = get_field(fields, "MEARS Eviction Date")
     eviction_date = parse_date(eviction_raw)
+
     gdrive = get_field(fields, "Link")
 
-    # Extra fields
     spring_issue = get_field(fields, "SPRING - Issue^")
     coss_support = get_field(fields, "CoSS Support Provided")
     supporting_docs = get_field(fields, "Supporting Documents attached")
     coss_support_1y = get_field(fields, "CoSS Support Provided (1y)")
+
     coss_notes = get_field(fields, "CoSS Notes")
     scc_notes = get_field(fields, "SCC Notes")
+    cas_notes = get_field(fields, "CAS Notes")
 
-    # Description uses WhatsApp number
-    desc = (
-        f"AIRTABLE_RECORD_ID:\n{record_id}\n\n"
-        f"WhatsApp Web:\nhttps://web.whatsapp.com/send?phone={whatsapp_number_clean}\n\n"
-        f"WhatsApp Phone:\nhttps://wa.me/{whatsapp_number_clean}\n\n"
-        f"SPRING - Issue:\n{spring_issue}\n\n"
-        f"CoSS Support Provided:\n{coss_support}\n\n"
-        f"Supporting Documents attached:\n{supporting_docs}\n\n"
-        f"CoSS Support Provided (1y):\n{coss_support_1y}\n\n"
-        f"Airtable Link:\n{build_airtable_link(record_id)}\n\n"
-        f"Google Drive:\n{gdrive}"
+    last_modified = get_field(fields, "Last modified")
+
+    referral_requested_date = get_field(
+        fields,
+        "SCC - Referral requested (date)."
     )
 
-    # Card name uses Contact number
-    card_name = f"{fullname} – Phone: {contact_number} – Eviction date: {eviction_raw}"
+    # =========================================================
+    # CARD NAME
+    # =========================================================
 
-    # Create card
-    card = trello_post("/cards", {
-        "idList": target_list_id,
-        "name": card_name,
-        "desc": desc,
-        "due": eviction_date.isoformat() if eviction_date else None,
-        "pos": calculate_card_position(eviction_date)
-    })
+    card_name = (
+        f"{fullname} – Phone: {contact_phone} "
+        f"– Eviction date: {eviction_raw}"
+    )
 
-    # Add comments
-    comment_text = ""
-    if coss_notes:
-        comment_text += f"CoSS Notes:\n{coss_notes.strip()}\n\n"
-    if scc_notes:
-        comment_text += f"SCC Notes:\n{scc_notes.strip()}\n\n"
-    if comment_text:
-        trello_post(f"/cards/{card['id']}/actions/comments", {"text": comment_text.strip()})
+    # =========================================================
+    # DESCRIPTION
+    # SAME AS MAIN SYNC
+    # =========================================================
 
-    # Labels
+    desc = (
+        f"WhatsApp Web:\n"
+        f"https://web.whatsapp.com/send?phone={whatsapp_number}\n\n"
+
+        f"WhatsApp Phone:\n"
+        f"https://wa.me/{whatsapp_number}\n\n"
+
+        f"SPRING - Issue:\n"
+        f"{spring_issue}\n\n"
+
+        f"CoSS Support Provided:\n"
+        f"{coss_support}\n\n"
+
+        f"Supporting Documents attached:\n"
+        f"{supporting_docs}\n\n"
+
+        f"'':{record_id}\n\n"
+    )
+
+    # =========================================================
+    # CREATE CARD
+    # =========================================================
+
+    card = trello_post(
+        "/cards",
+        {
+            "idList": target_list_id,
+            "name": card_name,
+            "desc": desc,
+            "due": (
+                eviction_date.isoformat()
+                if eviction_date else None
+            ),
+            "pos": calculate_card_position(eviction_date)
+        }
+    )
+
+    card_id = card["id"]
+
+    # =========================================================
+    # COMMENTS
+    # SAME AS MAIN SYNC
+    # =========================================================
+
+    add_comment(
+        card_id,
+        record_id,
+        last_modified,
+        coss_notes,
+        scc_notes,
+        cas_notes,
+        gdrive,
+        fullname
+    )
+
+    # =========================================================
+    # REFERRAL LABEL
+    # =========================================================
+
+    ensure_referral_label(
+        card_id,
+        referral_requested_date
+    )
+
+    # =========================================================
+    # STATUS LABELS
+    # SAME AS MAIN SYNC
+    # =========================================================
+
     status = get_case_status(eviction_date)
-    if "Urgent" in status:
-        trello_post(f"/cards/{card['id']}/labels", {"color": "red"})
-    elif "Pending" in status:
-        trello_post(f"/cards/{card['id']}/labels", {"color": "yellow"})
-    else:
-        trello_post(f"/cards/{card['id']}/labels", {"color": "green"})
 
-    log(f"✅ Created card: {card_name} in list {target_list_id}")
+    if "Urgent" in status:
+        trello_post(
+            f"/cards/{card_id}/labels",
+            {"color": "red"}
+        )
+
+    elif "Pending" in status:
+        trello_post(
+            f"/cards/{card_id}/labels",
+            {"color": "yellow"}
+        )
+
+    else:
+        trello_post(
+            f"/cards/{card_id}/labels",
+            {"color": "green"}
+        )
+
+    log(
+        f"✅ Created card: "
+        f"{card_name} "
+        f"({record_id})"
+    )
+
+    return card
 
 # =========================================================
 # RUN INTERACTIVE
 # =========================================================
 
+# if __name__ == "__main__":
+#     record_id = input("Enter Airtable Record ID: ").strip()
+#     print("Available lists:")
+#     for i, lid in enumerate(EXISTING_LIST_IDS):
+#         print(f"{i+1}. {lid}")
+#     choice = int(input(f"Select target list (1-{len(EXISTING_LIST_IDS)}): ").strip())
+#     target_list_id = EXISTING_LIST_IDS[choice-1]
+
+#     create_card_from_airtable(record_id, target_list_id)
+
 if __name__ == "__main__":
     record_id = input("Enter Airtable Record ID: ").strip()
-    print("Available lists:")
-    for i, lid in enumerate(EXISTING_LIST_IDS):
-        print(f"{i+1}. {lid}")
-    choice = int(input(f"Select target list (1-{len(EXISTING_LIST_IDS)}): ").strip())
-    target_list_id = EXISTING_LIST_IDS[choice-1]
+
+    print("\nAvailable lists:")
+
+    for i, lid in enumerate(EXISTING_LIST_IDS, start=1):
+        try:
+            list_info = trello_get(f"/lists/{lid}")
+            print(f"{i}. {list_info['name']}")
+        except Exception as e:
+            print(f"{i}. {lid} (Error loading name: {e})")
+
+    choice = int(
+        input(
+            f"\nSelect target list (1-{len(EXISTING_LIST_IDS)}): "
+        ).strip()
+    )
+
+    target_list_id = EXISTING_LIST_IDS[choice - 1]
 
     create_card_from_airtable(record_id, target_list_id)
