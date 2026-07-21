@@ -457,17 +457,6 @@ def create_card(data, link):
 Name: {name}
 Phone: {contact_phone}
 Email: {get_field(data,'email')}
-DOB: {get_field(data,'dob')}
-Address: {get_field(data,'address')}
-
-Referrer:
-{referrer}
-
-Notes:
-{get_field(data,'notes')}
-
-Other (please explain):
-{get_field(data,'notes')}
 
 📱 WhatsApp:
 https://wa.me/{whatsapp_number}

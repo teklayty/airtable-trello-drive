@@ -437,25 +437,22 @@ def extract_phone_from_card(card):
     text = card.get("name", "") + " " + card.get("desc", "")
 
     matches = re.findall(
-        r"(?:\+44|44|0)?\s?\d[\d\s\-()]{8,}",
+        r"(?:\+44|44|0)?[\d\s()\-]{9,}",
         text
     )
 
+    phones = []
+
     for match in matches:
         cleaned = clean_phone(match)
-        log(
-            f"PHONE INDEX ENTRY: raw='{match}' "
-            f"cleaned='{cleaned}'"
-        )
 
         if len(cleaned) >= 11:
-            return cleaned
+            phones.append(cleaned)
 
-   
+    if not phones:
+        return ""
 
-
-    return ""
-
+    return max(phones, key=len)
 
 
 
@@ -863,13 +860,15 @@ for record in records:
                             log(f"⚠️ Manual duplicate detected: {other_card['name']}")
                             mark_and_move_to_cleanup(other_card)
 
+                        log(
+                            f"COMPARE | incoming={phone} "
+                            f"| stored={stored_phone} "
+                            f"| match={phone_matches(phone, stored_phone)}"
+                        )
 
-        log(
-            f"COMPARE: Airtable={phone} "
-            f"Stored={stored_phone} "
-            f"Match={phone_matches(phone, stored_phone)}"
-        )
 
+
+        
         print(clean_phone("07116315678"))
         print(clean_phone("7116315678"))
         print(phone_matches(
