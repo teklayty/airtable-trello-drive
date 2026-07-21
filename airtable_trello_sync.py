@@ -124,23 +124,9 @@ def get_field(fields, key):
         return ", ".join(map(str, value))
     return str(value).strip()
 
-def clean_phone(phone):
-    digits = "".join(filter(str.isdigit, str(phone)))
-    if digits.startswith("44"):
-        return digits
-    if digits.startswith("0"):
-        return f"44{digits[1:]}"
-    return f"44{digits}"
-
-def build_notes_link(record_id):
-    return (
-        f"https://airtable.com/"
-        f"{AIRTABLE_BASE_ID}/"
-        f"{AIRTABLE_NOTES_PAGE_ID}"
-        f"?{AIRTABLE_NOTES_PARAM}={record_id}"
-    )
 def build_airtable_link(record_id):
-    return f"https://airtable.com/{AIRTABLE_BASE_ID}/{AIRTABLE_TABLE_ID}/{AIRTABLE_VIEW_ID}/{record_id}?blocks=hide"
+    return build_notes_link(record_id)
+
 
 def get_case_status(eviction_date):
     if not eviction_date:
@@ -168,17 +154,8 @@ def generate_notes_anchor_link(record_id):
 
 
 def generate_interface_link(record_id):
-    base_url = "https://airtable.com/appt4PI9krGalheLk/pagLsUMtGqYgvu2a5"
+    return build_notes_link(record_id)
 
-    detail = {
-        "pageId": "pagB5URnGwh70uwTB",
-        "rowId": record_id,
-        "showComments": False
-    }
-
-    encoded = urllib.parse.quote(json.dumps(detail))
-
-    return f"{base_url}?detail={encoded}"
 
 # =========================================================
 # LABELING CARDS IF NO REFERRAL TO COUNCIL
@@ -459,20 +436,26 @@ def airtable_get_all_records():
 def extract_phone_from_card(card):
     text = card.get("name", "") + " " + card.get("desc", "")
 
-    # log(f"Current Airtable phone: {phone}")
-    # log(f"Checking against index: {list(phone_index.keys())}")
-
-
-    # Look for UK numbers more strictly
-    matches = re.findall(r"(?:\+44|0)\s?\d[\d\s\-()]{8,}", text)
+    matches = re.findall(
+        r"(?:\+44|44|0)?\s?\d[\d\s\-()]{8,}",
+        text
+    )
 
     for match in matches:
         cleaned = clean_phone(match)
+        log(
+            f"PHONE INDEX ENTRY: raw='{match}' "
+            f"cleaned='{cleaned}'"
+        )
 
         if len(cleaned) >= 11:
             return cleaned
 
+   
+
+
     return ""
+
 
 
 
@@ -881,6 +864,20 @@ for record in records:
                             mark_and_move_to_cleanup(other_card)
 
 
+        log(
+            f"COMPARE: Airtable={phone} "
+            f"Stored={stored_phone} "
+            f"Match={phone_matches(phone, stored_phone)}"
+        )
+
+        print(clean_phone("07116315678"))
+        print(clean_phone("7116315678"))
+        print(phone_matches(
+            clean_phone("07116315678"),
+            clean_phone("7116315678")
+        ))
+
+        log(f"PHONE INDEX: {phone_index.keys()}")
 
 
 

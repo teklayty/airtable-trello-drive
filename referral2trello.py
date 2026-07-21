@@ -4,6 +4,9 @@ import os
 import shutil
 import pickle
 from docx import Document
+import subprocess
+from pypdf import PdfReader
+
 
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
@@ -64,14 +67,108 @@ def get_drive_service():
 
     return build("drive", "v3", credentials=creds)
 
+
+def extract_pdf_fields(file_path):
+    reader = PdfReader(file_path)
+
+    text = ""
+
+    for page in reader.pages:
+        page_text = page.extract_text()
+
+        if page_text:
+            text += page_text + "\n"
+
+    data = {"notes": text}
+
+    phone_match = re.search(
+        r"(\+44\s?\d[\d\s]+|0\d[\d\s]{8,})",
+        text
+    )
+
+    if phone_match:
+        data["phone"] = phone_match.group(1)
+
+    email_match = re.search(
+        r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}",
+        text
+    )
+
+    if email_match:
+        data["email"] = email_match.group(0)
+
+    # crude name extraction
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+
+    if lines:
+        data["name"] = lines[0]
+    else:
+        data["name"] = "Unknown Client"
+
+    return data
+
+
+def extract_doc_fields(file_path):
+
+    subprocess.run(
+        [
+            "libreoffice",
+            "--headless",
+            "--convert-to",
+            "docx",
+            file_path,
+            "--outdir",
+            os.path.dirname(file_path)
+        ],
+        check=True
+    )
+
+    converted = os.path.splitext(file_path)[0] + ".docx"
+
+    return extract_docx_fields(converted)
+
+
+def extract_pdf_text(file_path):
+    text = ""
+
+    reader = PdfReader(file_path)
+
+    for page in reader.pages:
+        page_text = page.extract_text()
+
+        if page_text:
+            text += page_text + "\n"
+
+    return text
+
+def extract_fields(file_path):
+
+    ext = os.path.splitext(file_path)[1].lower()
+
+    if ext == ".docx":
+        return extract_docx_fields(file_path)
+
+    elif ext == ".pdf":
+        return extract_pdf_fields(file_path)
+
+    elif ext == ".doc":
+        return extract_doc_fields(file_path)
+
+    raise ValueError(f"Unsupported file type: {ext}")
+
+
 # ================================
 # 🧠 FIELD EXTRACTION (FORM AWARE)
 # ================================
 
-def extract_fields(file_path):
+def extract_docx_fields(file_path):
     doc = Document(file_path)
 
     data = {"notes": ""}
+
+    # ================================
+    # READ TABLES
+    # ================================
 
     for table in doc.tables:
         for row in table.rows:
@@ -86,41 +183,189 @@ def extract_fields(file_path):
             if not val:
                 continue
 
-            if "first name" in key:
+            if any(x in key for x in [
+                "first name",
+                "forename",
+                "client first name"
+            ]):
                 data["first_name"] = val
-            elif "surname" in key:
+
+            elif any(x in key for x in [
+                "surname",
+                "last name",
+                "family name"
+            ]):
                 data["surname"] = val
 
-            elif "telephone" in key or "contact" in key:
+            elif any(x in key for x in [
+                "telephone",
+                "phone",
+                "mobile",
+                "contact",
+                "contact number",
+                "phone number"
+            ]):
                 data["phone"] = val
+
             elif "whatsapp" in key:
                 data["whatsapp"] = val
 
             elif "email" in key:
                 data["email"] = val
-            elif "date of birth" in key:
-                data["dob"] = val
+
             elif "address" in key:
                 data["address"] = val
 
-            # ✅ Referrer
-            elif "form completed by" in key:
+            elif "date of birth" in key or "dob" in key:
+                data["dob"] = val
+
+            elif any(x in key for x in [
+                "form completed by",
+                "completed by",
+                "referrer"
+            ]):
                 data["referrer"] = val
 
-            # ✅ Notes from multiple sections
-            elif "other" in key:
-                data["notes"] += val + "\n"
-            elif "support" in key:
-                data["notes"] += val + "\n"
-            elif "household" in key:
+            else:
                 data["notes"] += val + "\n"
 
-    # Combine name
+    # ================================
+    # READ PARAGRAPHS
+    # ================================
+
+    for para in doc.paragraphs:
+        text = para.text.strip()
+
+        if text:
+            data["notes"] += text + "\n"
+
+    # ================================
+    # FALLBACK PHONE SEARCH
+    # ================================
+
+    full_text = "\n".join(
+        p.text for p in doc.paragraphs
+    )
+
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                full_text += "\n" + cell.text
+
+    if not data.get("phone"):
+        phone_match = re.search(
+            r"(\+44\s?\d[\d\s]+|0\d[\d\s]{8,})",
+            full_text
+        )
+
+        if phone_match:
+            data["phone"] = phone_match.group(1)
+
+    if not data.get("email"):
+        email_match = re.search(
+            r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}",
+            full_text
+        )
+
+        if email_match:
+            data["email"] = email_match.group(0)
+
+    # ================================
+    # NAME
+    # ================================
+
     first = data.get("first_name", "")
     surname = data.get("surname", "")
+
     data["name"] = f"{first} {surname}".strip()
 
+    if not data["name"]:
+        data["name"] = "Unknown Client"
+
     return data
+
+
+    # =================================
+    # READ PARAGRAPHS TOO
+    # =================================
+
+    for para in doc.paragraphs:
+        text = para.text.strip()
+
+        if not text:
+            continue
+
+        lower = text.lower()
+
+        if (
+            "telephone" in lower
+            or "phone" in lower
+            or "mobile" in lower
+        ):
+            if "phone" not in data:
+                phone_match = re.search(
+                    r"(\+44\s?\d[\d\s]+|0\d[\d\s]{8,})",
+                    text
+                )
+
+                if phone_match:
+                    data["phone"] = phone_match.group(1)
+
+        elif "email" in lower:
+            if "email" not in data:
+                email_match = re.search(
+                    r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}",
+                    text
+                )
+
+                if email_match:
+                    data["email"] = email_match.group(0)
+
+        else:
+            data["notes"] += text + "\n"
+
+    # =================================
+    # FALLBACK FULL-TEXT SEARCH
+    # =================================
+
+    full_text = "\n".join(p.text for p in doc.paragraphs)
+
+    if not data.get("phone"):
+        phone_match = re.search(
+            r"(\+44\s?\d[\d\s]+|0\d[\d\s]{8,})",
+            full_text
+        )
+
+        if phone_match:
+            data["phone"] = phone_match.group(1)
+
+    if not data.get("email"):
+        email_match = re.search(
+            r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}",
+            full_text
+        )
+
+        if email_match:
+            data["email"] = email_match.group(0)
+
+    # =================================
+    # COMBINE NAME
+    # =================================
+
+    first = data.get("first_name", "")
+    surname = data.get("surname", "")
+
+    data["name"] = f"{first} {surname}".strip()
+
+    if not data["name"]:
+        data["name"] = (
+            data.get("first_name")
+            or data.get("surname")
+            or "Unknown Client"
+        )
+
+    return data
+
 
 # ================================
 # 🧹 HELPERS
@@ -239,11 +484,15 @@ https://web.whatsapp.com/send?phone={whatsapp_number}
         params={
             "key": TRELLO_API_KEY,
             "token": TRELLO_TOKEN,
+        },
+        data={
             "idList": TRELLO_LIST_ID,
             "name": f"{name} ({contact_phone})",
-            "desc": desc.strip(),
+            "desc": desc[:15000],   # optional safeguard
         }
     )
+
+    print(f"Description length: {len(desc)}")
 
     if response.status_code == 200:
         print("✅ Trello card created")
@@ -259,6 +508,13 @@ def process_file(file_path, seen):
 
     data = extract_fields(file_path)
 
+
+    print("\n=== EXTRACTED DATA ===")
+    for k, v in data.items():
+        print(f"{k}: {v}")
+    print("======================\n")
+
+
     duplicate, key = is_duplicate(data, seen)
     if duplicate:
         return
@@ -270,6 +526,12 @@ def process_file(file_path, seen):
     print(f"✏️ Renamed: {filename}")
 
     link = upload_to_drive(new_path)
+    
+    print("\n=== EXTRACTED ===")
+    for k, v in data.items():
+        print(f"{k}: {str(v)[:200]}")
+    print("=================\n")
+
 
     create_card(data, link)
 
@@ -288,8 +550,19 @@ def main():
     seen = load_seen()
 
     for f in os.listdir(INPUT_FOLDER):
-        if f.endswith(".docx"):
-            process_file(os.path.join(INPUT_FOLDER, f), seen)
+
+        if not f.lower().endswith((".docx", ".doc", ".pdf")):
+            continue
+
+        try:
+            process_file(
+                os.path.join(INPUT_FOLDER, f),
+                seen
+            )
+        except Exception as e:
+            print(f"❌ Failed {f}: {e}")
+
+
 
 # ================================
 
