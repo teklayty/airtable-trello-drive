@@ -464,7 +464,7 @@ https://wa.me/{whatsapp_number}
 💬 WhatsApp Web:
 https://web.whatsapp.com/send?phone={whatsapp_number}
 
-📎 File:
+📎 Referral File:
 {link}
 """
 

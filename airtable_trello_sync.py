@@ -249,6 +249,38 @@ def build_prefill_form_link(fullname, airtable_id):
         f"?prefill_Client%20ID%20and%20Full%20Name={encoded_value}"
     )
 
+# =========================================================
+# GET RETAINED REFERRAL LINK
+# ========================================================= 
+def get_retained_referral_link(card_id):
+
+    try:
+        card = trello_get(
+            f"/cards/{card_id}",
+            {"fields": "desc"}
+        )
+
+        desc = card.get("desc", "")
+
+        lines = desc.splitlines()
+
+        for i, line in enumerate(lines):
+
+            if "REFERRAL_DOCUMENTS:" in line:
+
+                if i + 1 < len(lines):
+
+                    url = lines[i + 1].strip()
+
+                    if "drive.google.com" in url:
+                        return url
+
+    except Exception as e:
+        log(f"Could not read retained referral link: {e}", "error")
+
+    return ""
+
+
 
 # =========================================================
 # Format Comments Nicely
@@ -317,6 +349,7 @@ def delete_all_comments(card_id):
         except Exception as e:
             log(f"Could not delete comment: {e}", "error")
 
+
 def add_comment(
     card_id,
     record_id,
@@ -327,6 +360,8 @@ def add_comment(
     gdrive,
     fullname
 ):
+
+    
     delete_all_comments(card_id)
 
     notes_link = build_notes_link(record_id)
@@ -348,12 +383,18 @@ def add_comment(
     if cas_notes and str(cas_notes).strip():
         lines.append(f"🟩 CAS Notes:\n{notes_link}\n")
 
+    drive_links = []
+
     if gdrive and str(gdrive).strip():
-        lines.extend([
-            "",
-            "📁 Google Drive:",
-            gdrive
-        ])
+        drive_links.append(
+            f"📁 Client Documents:\n{gdrive}"
+        )
+
+    
+
+    if drive_links:
+        lines.append("")
+        lines.extend(drive_links)
 
     lines.extend([
         "",
@@ -363,10 +404,16 @@ def add_comment(
 
     comment_text = "\n".join(lines)
 
+    log("ABOUT TO POST COMMENT")
+    log(comment_text)
+
     trello_post(
         f"/cards/{card_id}/actions/comments",
         {"text": comment_text}
     )
+
+    log("COMMENT POSTED SUCCESSFULLY")
+
 
 
 
@@ -405,6 +452,68 @@ def add_attachments(card_id, record_id, fullname, gdrive):
     delete_system_attachments(card_id)
     return
 
+# =========================================================
+# GET DRIVE LINK
+# =========================================================  
+def get_drive_link_from_card(card_id):
+
+    try:
+        card = trello_get(
+            f"/cards/{card_id}",
+            {
+                "fields": "name,desc"
+            }
+        )
+
+        desc = card.get("desc", "")
+
+        matches = re.findall(
+            r'https?://[^\s\]]+',
+            desc
+        )
+
+        log(f"CARD: {card['name']}")
+        log(f"URLS FOUND: {matches}")
+
+        for link in matches:
+
+            link = link.strip()
+            link = link.lstrip("[")
+            link = link.rstrip("]>.,)")
+
+            if (
+                "drive.google.com" in link
+                or "docs.google.com" in link
+            ):
+                log(f"✅ DRIVE LINK FOUND: {link}")
+                return link
+
+    except Exception as e:
+        log(f"Failed to extract Drive link: {e}", "error")
+
+    return ""
+
+
+
+
+
+
+
+# =========================================================
+# GET DRIVE ATTACHMENT
+# ========================================================= 
+def get_drive_attachment(card_id):
+    attachments = trello_get(
+        f"/cards/{card_id}/attachments"
+    )
+
+    for att in attachments:
+        url = att.get("url", "")
+
+        if "drive.google.com" in url:
+            return url
+
+    return None
 
 
 # =========================================================
@@ -505,6 +614,7 @@ def load_existing_cards():
 
             log(f"📞 Phone index built: { {k: len(v) for k,v in phone_index.items()} }")
 
+
             # =====================================================
             # ✅ Existing Airtable ID logic (unchanged)
             # =====================================================
@@ -576,6 +686,8 @@ def delete_system_attachments(card_id):
                 trello_delete(f"/cards/{card_id}/attachments/{att['id']}")
             except Exception as e:
                 log(f"Could not delete attachment: {e}", "error")
+
+
 # =========================================================
 # MARK AND MOVE TO CLEANUP
 # =========================================================
@@ -702,6 +814,7 @@ for record in records:
         scc_notes = get_field(fields, "SCC Notes")
         cas_notes = get_field(fields, "CAS Notes")
         last_modified = get_field(fields, "Last modified")
+        referral_drive_link = ""
         referral_requested_date = get_field(
             fields,
             "SCC - Referral requested (date)."
@@ -718,6 +831,7 @@ for record in records:
         print(f"Match: {ia_clean == wa_clean}")
 
 
+        log(f"BEFORE BUILD DESC referral_drive_link={referral_drive_link}")
 
 
         desc = (
@@ -729,34 +843,184 @@ for record in records:
             f"'':{airtable_id}\n\n"
             )
 
+        
+        retained_referral_link = ""
+
         if airtable_id in existing_cards:
+
+            log(f"AIRTABLE ID = {airtable_id}")
+            log(f"FOUND IN EXISTING = {airtable_id in existing_cards}")
+
             existing = existing_cards[airtable_id]
             card = existing["card"]
             card_id = card["id"]
+
             log(f"🔄 Updating existing card: {card_name}")
+
             if existing["closed"]:
-                trello_put(f"/cards/{card_id}", {"closed": "false"})
-            clean_card(card_id)
-            trello_put(f"/cards/{card_id}", {
-                "name": card_name,
-                "desc": desc,
-                "due": eviction_date.isoformat() if eviction_date else None,
-                "pos": calculate_card_position(eviction_date)
-            })
+                trello_put(
+                    f"/cards/{card_id}",
+                    {"closed": "false"}
+                )
+
+            log(f"EXISTING CARD COUNT = {len(existing_cards)}")
+
+            # Save referral link BEFORE wiping description
+            retained_referral_link = get_retained_referral_link(card_id)
             updated += 1
+
+
         else:
+
             log(f"🆕 Creating new card: {card_name}")
-            card = trello_post("/cards", {
-                "idList": CREATE_LIST_ID,
-                "name": card_name,
-                "desc": desc,
-                "due": eviction_date.isoformat() if eviction_date else None,
-                "pos": calculate_card_position(eviction_date)
-            })
+
+            card = trello_post(
+                "/cards",
+                {
+                    "idList": CREATE_LIST_ID,
+                    "name": card_name,
+                    "desc": "",
+                    "due": eviction_date.isoformat() if eviction_date else None,
+                    "pos": calculate_card_position(eviction_date)
+                }
+            )
+
             card_id = card["id"]
-            existing_cards[airtable_id] = {"card": card, "closed": False}
+
+            existing_cards[airtable_id] = {
+                "card": card,
+                "closed": False
+            }
+
             created += 1
 
+            # =========================================================
+            # ✅ DUPLICATE CHECK (MOVE THIS INTO YOUR MAIN LOOP)
+            # =========================================================
+
+            phone = clean_phone(
+                whatsapp_phone or contact_phone
+            )
+
+
+            if phone:
+
+                for stored_phone, cards_list in phone_index.items():
+
+                    log(
+                        f"COMPARE CREATE | incoming={phone} "
+                        f"| stored={stored_phone} "
+                        f"| match={phone_matches(phone, stored_phone)}"
+                    )
+
+
+                    if not phone_matches(phone, stored_phone):
+                        continue
+
+                    for other_card in cards_list:
+
+                        other_id = other_card["id"]
+
+                        if other_id == card_id:
+                            continue
+
+                        card_details = trello_get(
+                            f"/cards/{other_id}",
+                            {"fields": "name,desc"}
+                        )
+
+                        other_airtable_id = extract_airtable_id_from_card(
+                            card_details.get("desc", "")
+                        )
+
+                        if other_airtable_id:
+                            continue
+
+                        log(
+                            f"CARD={other_card['name']} "
+                            f"AIRTABLE_ID={other_airtable_id}"
+                        )
+
+
+                        existing_drive = get_drive_link_from_card(other_id)
+
+                        log("================================")
+                        log(f"MATCH FOUND")
+                        log(f"PHONE={phone}")
+                        log(f"STORED={stored_phone}")
+                        log(f"CARD={other_card['name']}")
+                        log("================================")
+
+
+                        if existing_drive:
+
+                            referral_drive_link = existing_drive
+
+                            log(
+                                f"📁 Found duplicate drive link: "
+                                f"{referral_drive_link}"
+                            )
+
+                            log(f"AFTER DETECTION referral_drive_link={referral_drive_link}")
+
+
+                        mark_and_move_to_cleanup(other_card)
+                        break
+        # If updating, use retained copy
+        if not referral_drive_link:
+            referral_drive_link = retained_referral_link
+
+        desc = (
+            f"WhatsApp Web:\n"
+            f"https://web.whatsapp.com/send?phone={whatsapp_number}\n\n"
+
+            f"WhatsApp Phone:\n"
+            f"https://wa.me/{whatsapp_number}\n\n"
+
+            f"SPRING - Issue:\n"
+            f"{spring_issue}\n\n"
+
+            f"CoSS Support Provided:\n"
+            f"{coss_support}\n\n"
+
+            f"Supporting Documents attached:\n"
+            f"{supporting_docs}\n\n"
+
+            f"AIRTABLE_RECORD_ID:\n"
+            f"{airtable_id}\n"
+        )
+
+        if referral_drive_link:
+
+            desc += (
+                "\n\n"
+                "REFERRAL_DOCUMENTS:\n"
+                f"{referral_drive_link}\n"
+            )
+
+        log("FINAL DESC:")
+        log(desc)
+
+        clean_card(card_id)
+
+        trello_put(
+            f"/cards/{card_id}",
+            {
+                "name": card_name,
+                "desc": desc,
+                "due": eviction_date.isoformat() if eviction_date else None,
+                "pos": calculate_card_position(eviction_date)
+            }
+        )
+
+
+
+        log(
+                f"ADDING REFERRAL LINK BACK TO DESC: "
+                f"{referral_drive_link}"
+            )
+
+    
         # =========================================================
         # Remove attachments
         # =========================================================
@@ -766,7 +1030,30 @@ for record in records:
         for att in attachments:
             trello_delete(f"/cards/{card_id}/attachments/{att['id']}")
 
+        
+        log(f"Client docs: {gdrive}")
+        log(f"Referral docs: {referral_drive_link}")
+        log(f"CLIENT DOCS = {gdrive}")
+        log(f"REFERRAL DOCS = {referral_drive_link}")
 
+
+        log(f"INSIDE add_comment() referral={referral_drive_link}")
+        log("====================================")
+        log(f"FINAL referral_drive_link = {referral_drive_link}")
+        log("====================================")
+
+        log("========= COMMENT INPUT =========")
+        log(f"gdrive={gdrive}")
+        log(f"referral_drive_link={referral_drive_link}")
+        log("================================")
+
+
+        
+
+        log(f"FINAL referral_drive_link = {referral_drive_link}")
+
+
+        
         # ✅ Add secure Airtable link instead of raw notes
         add_comment(
             card_id,
@@ -778,6 +1065,7 @@ for record in records:
             gdrive,
             fullname
         )
+
 
         log(
             f"DEBUG: {fullname} | SCC referral date = {repr(referral_requested_date)}"
@@ -795,87 +1083,7 @@ for record in records:
 
 
 
-        # =========================================================
-        # ✅ ADD PREFILLED FORM LINK AS COMMENT
-        # =========================================================
-
-        form_link = build_prefill_form_link(fullname, airtable_id)
-
         
-        # =========================================================
-        # LABELS (preserve staff labels)
-        # =========================================================
-
-        status = get_case_status(eviction_date)
-
-        # ✅ Get full label objects (NOT just IDs)
-        existing_labels = trello_get(f"/cards/{card_id}/labels")
-
-        # Define status colours
-        status_colours = {"red", "yellow", "green"}
-
-        # ✅ Remove ONLY status labels
-        for lbl in existing_labels:
-            if lbl.get("color") in status_colours:
-                trello_delete(f"/cards/{card_id}/idLabels/{lbl['id']}")
-
-        # =========================================================
-        # MOVE TO URGENT LIST
-        # =========================================================
-
-        if eviction_date and urgent_list_id and (eviction_date - TODAY).days < 14:
-            current_list_id = card.get("idList")
-            if current_list_id == CREATE_LIST_ID:
-                trello_put(f"/cards/{card_id}", {"idList": urgent_list_id})
-                log(f"➡️ Card moved to urgent list: {card_name}")
-            else:
-                log(f"ℹ️ Card NOT moved (not in CREATE_LIST_ID): {card_name}")
-
-        # =========================================================
-        # ✅ DUPLICATE CHECK (MOVE THIS INTO YOUR MAIN LOOP)
-        # =========================================================
-        # ⚠️ IMPORTANT: this block MUST run INSIDE your Airtable loop
-
-        phone = clean_phone(contact_phone)
-
-        if phone:
-            for stored_phone, cards_list in phone_index.items():
-
-                if not stored_phone:
-                    continue
-
-                if phone_matches(phone, stored_phone):
-
-                    for other_card in cards_list:
-                        other_id = other_card["id"]
-
-                        # ✅ skip same card
-                        if other_id == card_id:
-                            continue
-
-                        other_airtable_id = extract_airtable_id_from_card(other_card)
-
-                        # ✅ ONLY manual cards (no Airtable ID)
-                        if not other_airtable_id:
-                            log(f"⚠️ Manual duplicate detected: {other_card['name']}")
-                            mark_and_move_to_cleanup(other_card)
-
-                        log(
-                            f"COMPARE | incoming={phone} "
-                            f"| stored={stored_phone} "
-                            f"| match={phone_matches(phone, stored_phone)}"
-                        )
-
-
-
-        
-        print(clean_phone("07116315678"))
-        print(clean_phone("7116315678"))
-        print(phone_matches(
-            clean_phone("07116315678"),
-            clean_phone("7116315678")
-        ))
-
         log(f"PHONE INDEX: {phone_index.keys()}")
 
 

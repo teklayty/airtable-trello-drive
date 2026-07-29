@@ -120,15 +120,6 @@ def calculate_card_position(eviction_date):
     days_until = (eviction_date - TODAY).days
     return max(days_until, 0)
 
-def get_case_status(eviction_date):
-    if not eviction_date:
-        return "🟡 Pending documents"
-    days = (eviction_date - TODAY).days
-    if days < 0 or days < 14:
-        return "🔴 Urgent eviction"
-    if days < 30:
-        return "🟡 Pending documents"
-    return "🟢 Active"
 
 # =========================================================
 # TRELLO API
@@ -161,6 +152,109 @@ def delete_all_comments(card_id):
         except Exception as e:
             log(f"Could not delete comment: {e}", "error")
 
+# =========================================================
+# FIND DUPLICATE CARDS BY PHONE
+# =========================================================
+def find_duplicate_card(phone):
+    phone = clean_phone(phone)
+
+    for list_id in EXISTING_LIST_IDS:
+        cards = trello_get(
+            f"/lists/{list_id}/cards",
+            {
+                "fields": "id,name,desc,idList"
+            }
+        )
+
+        for card in cards:
+            text = f"{card.get('name', '')} {card.get('desc', '')}"
+
+            matches = re.findall(
+                r"(?:\+44|44|0)?[\d\s()\-]{9,}",
+                text
+            )
+
+            for match in matches:
+                existing_phone = clean_phone(match)
+
+                if existing_phone and existing_phone[-9:] == phone[-9:]:
+                    return card
+
+    return None
+
+# =========================================================
+# EXTRACT DRIVE LINK
+# =========================================================    
+def get_drive_links_from_card(card_id):
+    links = []
+
+    try:
+        card = trello_get(
+            f"/cards/{card_id}",
+            {
+                "fields": "desc"
+            }
+        )
+
+        desc = card.get("desc", "")
+
+        log(f"DESCRIPTION FOUND:\n{desc}")
+
+        matches = re.findall(
+            r'https://drive\.google\.com[^\s\])"]+',
+            desc
+        )
+
+        for link in matches:
+
+            cleaned = (
+                link.strip()
+                .lstrip("[")
+                .rstrip("]>.,)")
+            )
+
+            if cleaned not in links:
+                links.append(cleaned)
+
+
+    except Exception as e:
+        log(f"Drive extraction failed: {e}")
+
+    log(f"DRIVE LINKS FOUND: {links}")
+
+    return list(set(links))
+
+
+# =========================================================
+# MOVE DUPLICATE DRIVE
+# ========================================================= 
+
+CLEANUP_LIST_ID = os.getenv("TRELLO_CLEANUP_LIST_ID")
+
+def move_duplicate_to_cleanup(card):
+    try:
+        trello_put(
+            f"/cards/{card['id']}",
+            {
+                "idList": CLEANUP_LIST_ID
+            }
+        )
+
+        trello_post(
+            f"/cards/{card['id']}/labels",
+            {
+                "name": "Duplicate,Delete Me!",
+                "color": "black"
+            }
+        )
+
+        log(
+            f"Moved duplicate card: "
+            f"{card['name']}"
+        )
+
+    except Exception as e:
+        log(f"Failed to move duplicate: {e}")
 
 def add_comment(
     card_id,
@@ -170,6 +264,7 @@ def add_comment(
     scc_notes,
     cas_notes,
     gdrive,
+    referral_drive_links,
     fullname
 ):
     delete_all_comments(card_id)
@@ -193,12 +288,64 @@ def add_comment(
     if cas_notes and str(cas_notes).strip():
         lines.append(f"🟩 CAS Notes:\n{notes_link}\n")
 
-    if gdrive and str(gdrive).strip():
+    # =====================================================
+    # CLIENT DOCUMENTS
+    # =====================================================
+
+    gdrive_clean = str(gdrive).strip() if gdrive else ""
+
+    if gdrive_clean:
         lines.extend([
             "",
-            "📁 Google Drive:",
-            gdrive
+            "📁 Client Documents:",
+            gdrive_clean
         ])
+
+    # =====================================================
+    # REFERRAL DOCUMENTS
+    # =====================================================
+
+    if referral_drive_links:
+
+        valid_links = []
+        seen = set()
+
+        for link in referral_drive_links:
+
+            cleaned = (
+                link.strip()
+                .rstrip("]>.,)")
+                .lstrip("[")
+            )
+
+            if not cleaned:
+                continue
+
+            if cleaned == gdrive_clean:
+                continue
+
+            if cleaned in seen:
+                continue
+
+            seen.add(cleaned)
+            valid_links.append(cleaned)
+
+
+        if valid_links:
+
+            log(f"REFERRAL LINKS RAW: {referral_drive_links}")
+            log(f"REFERRAL LINKS CLEANED: {valid_links}")
+
+
+            lines.append("")
+            lines.append("📁 Referral Documents:")
+
+            for link in valid_links:
+                lines.append(link)
+
+    # =====================================================
+    # COSS SUPPORT FORM
+    # =====================================================
 
     lines.extend([
         "",
@@ -208,10 +355,20 @@ def add_comment(
 
     comment_text = "\n".join(lines)
 
+    log("====================================")
+    log("COMMENT TO BE POSTED:")
+    log(comment_text)
+    log("====================================")
+
     trello_post(
         f"/cards/{card_id}/actions/comments",
-        {"text": comment_text}
+        {
+            "text": comment_text
+        }
     )
+
+    log(f"✅ Comment added to card {card_id}")
+
 
 # =========================================================
 # TRELLO API
@@ -312,10 +469,28 @@ def create_card_from_airtable(record_id, target_list_id):
 
     whatsapp_number = clean_phone(whatsapp_phone)
 
+    duplicate_card = find_duplicate_card(contact_phone)
+
+    referral_drive_links = []
+
+    if duplicate_card:
+
+        referral_drive_links = get_drive_links_from_card(
+            duplicate_card["id"]
+        )
+
+        log(
+            f"Duplicate card ID: {duplicate_card['id']}"
+            f"Referral drive links found: {referral_drive_links}"
+        )
+
+
+
     eviction_raw = get_field(fields, "MEARS Eviction Date")
     eviction_date = parse_date(eviction_raw)
 
     gdrive = get_field(fields, "Link")
+
 
     spring_issue = get_field(fields, "SPRING - Issue^")
     coss_support = get_field(fields, "CoSS Support Provided")
@@ -339,7 +514,6 @@ def create_card_from_airtable(record_id, target_list_id):
 
     card_name = (
         f"{fullname} – Phone: {contact_phone} "
-        f"– Eviction date: {eviction_raw}"
     )
 
     # =========================================================
@@ -399,8 +573,13 @@ def create_card_from_airtable(record_id, target_list_id):
         scc_notes,
         cas_notes,
         gdrive,
+        referral_drive_links,
         fullname
     )
+
+    if duplicate_card:
+        move_duplicate_to_cleanup(duplicate_card)
+
 
     # =========================================================
     # REFERRAL LABEL
@@ -411,38 +590,7 @@ def create_card_from_airtable(record_id, target_list_id):
         referral_requested_date
     )
 
-    # =========================================================
-    # STATUS LABELS
-    # SAME AS MAIN SYNC
-    # =========================================================
-
-    status = get_case_status(eviction_date)
-
-    if "Urgent" in status:
-        trello_post(
-            f"/cards/{card_id}/labels",
-            {"color": "red"}
-        )
-
-    elif "Pending" in status:
-        trello_post(
-            f"/cards/{card_id}/labels",
-            {"color": "yellow"}
-        )
-
-    else:
-        trello_post(
-            f"/cards/{card_id}/labels",
-            {"color": "green"}
-        )
-
-    log(
-        f"✅ Created card: "
-        f"{card_name} "
-        f"({record_id})"
-    )
-
-    return card
+    
 
 # =========================================================
 # RUN INTERACTIVE
