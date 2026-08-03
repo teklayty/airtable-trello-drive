@@ -521,17 +521,19 @@ def get_drive_attachment(card_id):
 # =========================================================
 
 def airtable_get_all_records(limit=60):
-    """Fetch newest Airtable records, capped at limit"""
+    """
+    Fetch records exactly in the order they appear in the Airtable view.
+    No additional sorting is applied.
+    """
     records = []
     offset = None
 
-    while len(records) < limit:
+    while True:
         url = f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{AIRTABLE_TABLE_ID}"
 
         params = {
             "view": AIRTABLE_VIEW_ID,
-            "sort[0][field]": "Created",
-            "sort[0][direction]": "desc"
+            "pageSize": 100
         }
 
         if offset:
@@ -545,17 +547,17 @@ def airtable_get_all_records(limit=60):
         r.raise_for_status()
 
         data = r.json()
+
         records.extend(data.get("records", []))
 
-        if len(records) >= limit:
-            records = records[:limit]
-            break
-
         offset = data.get("offset")
+
         if not offset:
             break
 
-    return records
+    log(f"Fetched {len(records)} Airtable records")
+
+    return records[:limit]
 
 # =========================================================
 # MOVE TO URGENT LIST
@@ -770,8 +772,24 @@ for lst in trello_get(f"/boards/{board_id}/lists"):
     if lst["name"] == URGENT_LIST_NAME:
         urgent_list_id = lst["id"]
 
-records = airtable_get_all_records()
-log(f"🔄 Fetched {len(records)} Airtable records")
+records = airtable_get_all_records(limit=60)
+
+log("========== FIRST RECORDS FROM AIRTABLE ==========")
+
+for i, r in enumerate(records, start=1):
+    fields = r.get("fields", {})
+
+    log(
+        f"{i:02d}. "
+        f"{r['id']} | "
+        f"createdTime={r.get('createdTime')} | "
+        f"Created={fields.get('Created')} | "
+        f"{fields.get('Forename/First name(s)', '')} "
+        f"{fields.get('Surname/Last Name(s)', '')}"
+    )
+
+log("===============================================")
+
 
 created = updated = 0
 
@@ -780,38 +798,34 @@ for record in records:
         airtable_id = record.get("id")
         fields = record.get("fields", {})
 
-        created_at = parse_date(get_field(fields, "Created"))
+        # created_at = parse_date(get_field(fields, "Created"))
+        created_at = parse_iso(record["createdTime"]).replace(tzinfo=None)
         if created_at and created_at < TWO_MONTHS_AGO:
+            log(f"Skipping {airtable_id}: older than two months")
             continue  # skip old records
 
         first = get_field(fields, "Forename/First name(s)")
         last = get_field(fields, "Surname/Last Name(s)")
         fullname = f"{first} {last}".strip()
         if not fullname:
+            log(f"Skipping {airtable_id}: no full name")
             continue
 
         contact_phone = get_field(fields, "Contact number")
         whatsapp_phone = get_field(fields, "WhatsApp number") or contact_phone
         if not contact_phone and not whatsapp_phone:
+            log(f"Skipping {airtable_id}: no phone number")
             continue
 
         staff = get_field(fields, "(IA) Name of staff/volunteer").strip().lower()
 
-        if not ALLOWED_STAFF:
-            log("⚠️ No allowed staff list loaded — blocking all records", "error")
-            continue
-
-        # Skip records with missing staff
-        if not staff:
-            log(f"⏭ Skipped record {airtable_id}: No staff name", "warning")
-            continue
-
+        
         # Skip records where staff is not allowed
         if staff not in ALLOWED_STAFF:
             log(
                 f"⏭ Skipped record {airtable_id}: "
                 f"Staff '{staff}' not in allowed list",
-                "warning"
+                "⚠️ warning"
             )
             continue
         log(log("(IA) Name of staff/volunteer"))
