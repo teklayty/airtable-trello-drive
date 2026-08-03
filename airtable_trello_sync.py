@@ -520,22 +520,41 @@ def get_drive_attachment(card_id):
 # AIRTABLE API
 # =========================================================
 
-def airtable_get_all_records():
-    """Fetch all records from Airtable view"""
+def airtable_get_all_records(limit=60):
+    """Fetch newest Airtable records, capped at limit"""
     records = []
     offset = None
-    while True:
+
+    while len(records) < limit:
         url = f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{AIRTABLE_TABLE_ID}"
-        params = {"view": AIRTABLE_VIEW_ID}
+
+        params = {
+            "view": AIRTABLE_VIEW_ID,
+            "sort[0][field]": "Created",
+            "sort[0][direction]": "desc"
+        }
+
         if offset:
             params["offset"] = offset
-        r = requests.get(url, headers=AIRTABLE_HEADERS, params=params)
+
+        r = requests.get(
+            url,
+            headers=AIRTABLE_HEADERS,
+            params=params
+        )
         r.raise_for_status()
+
         data = r.json()
         records.extend(data.get("records", []))
+
+        if len(records) >= limit:
+            records = records[:limit]
+            break
+
         offset = data.get("offset")
         if not offset:
             break
+
     return records
 
 # =========================================================
