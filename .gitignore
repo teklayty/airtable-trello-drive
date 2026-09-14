@@ -13,3 +13,27 @@ __pycache__/
 .DS_Store
 
 token.pickle
+
+# Runtime/debug screenshots
+*_debug.png
+*_error.png
+chat_debug.png
+whatsapp_main_debug.png
+
+# WhatsApp runtime/profile data
+whatsapp_profile/
+whatsapp_profiles/
+
+# Local SQLite databases
+clients.db
+whatsapp_service.db
+whatsapp_service.db-shm
+whatsapp_service.db-wal
+
+*_debug.png
+*_error.png
+
+
+# WhatsApp debug/error screenshots
+whatsapp_debug_*.png
+whatsapp_error_*.png

@@ -47,6 +47,10 @@ AIRTABLE_NOTES_PARAM = os.getenv(
     "Pwx3z"
 )
 
+# Marker used so the Airtable sync can update only its own Trello comment.
+# Comments created by WhatsApp, operators, or other systems are preserved.
+AIRTABLE_COMMENT_MARKER = f"📌**SU AIRTABLE Record and Drive Docs**"
+
 
 TODAY = datetime.now()
 RECENT_ARCHIVE_DAYS = 10
@@ -138,11 +142,24 @@ def get_case_status(eviction_date):
         return "🟡 Pending documents"
     return "🟢 Active"
 
-def calculate_card_position(eviction_date):
-    if not eviction_date:
-        return 999999999
-    days_until = (eviction_date - TODAY).days
-    return max(days_until, 0)
+def calculate_card_position(created_at):
+    """
+    Return a stable Trello position based on the Airtable record creation time.
+
+    The client cards are ordered chronologically Old -> New.  The first card
+    in the list is reserved for the instruction card, so all client-card
+    positions are deliberately greater than zero.
+    """
+    if not created_at:
+        return 10**12
+
+    if created_at.tzinfo is not None:
+        created_at = created_at.astimezone(timezone.utc).replace(tzinfo=None)
+
+    # Trello sorts numeric positions from low to high.  Using the timestamp
+    # gives a deterministic Old -> New order without disturbing the instruction
+    # card at the top of the list.
+    return created_at.timestamp() + 1
 
 
 def generate_notes_anchor_link(record_id):
@@ -341,13 +358,59 @@ def trello_delete(path):
 # COMMENTS
 # =========================================================
 
-def delete_all_comments(card_id):
-    actions = trello_get(f"/cards/{card_id}/actions", {"filter": "commentCard"})
+def get_airtable_comment_actions(card_id):
+    """Return all Airtable-sync-owned Trello comment actions for a card."""
+    actions = trello_get(
+        f"/cards/{card_id}/actions",
+        {
+            "filter": "commentCard",
+            "limit": 1000,
+        }
+    )
+
+    owned = []
     for action in actions:
+        text = action.get("data", {}).get("text", "")
+        if AIRTABLE_COMMENT_MARKER in text:
+            owned.append(action)
+
+    return owned
+
+
+def delete_airtable_comments(card_id, keep_action_id=None):
+    """Delete duplicate Airtable-sync comments only.
+
+    All other Trello comments (WhatsApp/operator/manual comments, etc.) are
+    left untouched. When keep_action_id is supplied, that single comment is
+    retained and every other Airtable-owned comment is deleted.
+    """
+    actions = get_airtable_comment_actions(card_id)
+
+    for action in actions:
+        action_id = action.get("id")
+        if keep_action_id and action_id == keep_action_id:
+            continue
+
         try:
-            trello_delete(f"/actions/{action.get('id')}")
+            trello_delete(f"/actions/{action_id}")
+            log(
+                f"Deleted duplicate Airtable sync comment "
+                f"{action_id} from card {card_id}"
+            )
         except Exception as e:
-            log(f"Could not delete comment: {e}", "error")
+            log(
+                f"Could not delete Airtable sync comment {action_id}: {e}",
+                "error"
+            )
+
+
+def update_airtable_comment(action_id, comment_text):
+    """Update an existing Airtable-owned Trello comment in place."""
+    r = trello_put(
+        f"/actions/{action_id}/comments",
+        {"text": comment_text}
+    )
+    return r
 
 
 def add_comment(
@@ -362,17 +425,25 @@ def add_comment(
 ):
 
     
-    delete_all_comments(card_id)
+    # Only manage the Airtable-owned comment.
+    # Preserve WhatsApp/operator/manual comments on the same Trello card.
+    existing_airtable_comments = get_airtable_comment_actions(card_id)
+
+    # Keep one Airtable comment if one already exists; remove any duplicates.
+    keep_action_id = None
+    if existing_airtable_comments:
+        # Keep the newest Airtable-owned comment.
+        existing_airtable_comments.sort(
+            key=lambda a: a.get("date", "") or a.get("id", ""),
+            reverse=True
+        )
+        keep_action_id = existing_airtable_comments[0].get("id")
+        delete_airtable_comments(card_id, keep_action_id=keep_action_id)
 
     notes_link = build_notes_link(record_id)
     form_link = build_prefill_form_link(fullname, record_id)
 
-    lines = [
-        f"📌 Last updated: {last_modified}",
-        "",
-        "🔒 Notes stored in Airtable:",
-        ""
-    ]
+    lines = [AIRTABLE_COMMENT_MARKER ]
 
     if coss_notes and str(coss_notes).strip():
         lines.append(f"🟦 CoSS Notes:\n{notes_link}\n")
@@ -407,12 +478,20 @@ def add_comment(
     log("ABOUT TO POST COMMENT")
     log(comment_text)
 
-    trello_post(
-        f"/cards/{card_id}/actions/comments",
-        {"text": comment_text}
-    )
+    if keep_action_id:
+        update_airtable_comment(keep_action_id, comment_text)
+        log(
+            f"AIRTABLE COMMENT UPDATED IN PLACE "
+            f"action={keep_action_id}"
+        )
+    else:
+        trello_post(
+            f"/cards/{card_id}/actions/comments",
+            {"text": comment_text}
+        )
+        log("AIRTABLE COMMENT CREATED")
 
-    log("COMMENT POSTED SUCCESSFULLY")
+    log("COMMENT SYNC SUCCESSFUL")
 
 
 
@@ -914,7 +993,7 @@ for record in records:
                     "name": card_name,
                     "desc": "",
                     "due": eviction_date.isoformat() if eviction_date else None,
-                    "pos": calculate_card_position(eviction_date)
+                    "pos": calculate_card_position(created_at)
                 }
             )
 
@@ -1042,7 +1121,7 @@ for record in records:
                 "name": card_name,
                 "desc": desc,
                 "due": eviction_date.isoformat() if eviction_date else None,
-                "pos": calculate_card_position(eviction_date)
+                "pos": calculate_card_position(created_at)
             }
         )
 
@@ -1125,11 +1204,3 @@ for record in records:
         log(f"❌ Error processing {airtable_id}: {e}", "error")
 
 log(f"\n✅ Complete. Cards created: {created}, updated: {updated}")
-
-
-
-
-
-
-
-

@@ -273,10 +273,7 @@ def add_comment(
     form_link = build_prefill_form_link(fullname, record_id)
 
     lines = [
-        f"📌 Last updated: {last_modified}",
-        "",
-        "🔒 Notes stored in Airtable:",
-        ""
+        f"📌**SU AIRTABLE Record and Drive Docs**"
     ]
 
     if coss_notes and str(coss_notes).strip():
