@@ -16,7 +16,7 @@
   "use strict";
 
   const POWERUP_APP_NAME = "WhatsApp New Message - Mark Read";
-  const POWERUP_APP_KEY = "YOUR_TRELLO_POWERUP_APP_KEY";
+  const POWERUP_APP_KEY = "99fb195773ddc1e3bfbd79de31dd8647";
   const NEW_MESSAGE_LABEL_NAME = "New Message";
 
   const ICON_URL =
