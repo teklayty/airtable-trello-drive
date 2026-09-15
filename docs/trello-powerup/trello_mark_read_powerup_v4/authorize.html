@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Authorize Mark Read</title>
+</head>
+<body>
+  <p>Allow this Power-Up to remove the New Message label.</p>
+  <button id="authorize" type="button">Authorize</button>
+
+  <script src="https://p.trellocdn.com/power-up.min.js"></script>
+  <script>
+    (function () {
+      "use strict";
+
+      const POWERUP_APP_NAME = "WhatsApp New Message - Mark Read";
+      const POWERUP_APP_KEY = "51604b16c4177e1d0f91ff51797d1348";
+
+      const t = window.TrelloPowerUp.iframe({
+        appKey: POWERUP_APP_KEY,
+        appName: POWERUP_APP_NAME
+      });
+
+      const button = document.getElementById("authorize");
+
+      button.addEventListener("click", async function () {
+        button.disabled = true;
+        button.textContent = "Authorizing...";
+
+        try {
+          const rest = await t.getRestApi();
+          await rest.authorize({
+            scope: "read,write",
+            expiration: "never"
+          });
+
+          button.textContent = "Authorized";
+          await t.closePopup();
+          await t.notifyParent("done");
+        } catch (error) {
+          console.error("[WhatsApp Mark Read] authorization error:", error);
+          button.disabled = false;
+          button.textContent = "Authorize";
+          await t.alert({
+            message: "Authorization was not completed."
+          });
+        }
+      });
+    })();
+  </script>
+</body>
+</html>
