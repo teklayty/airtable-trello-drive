@@ -14,7 +14,7 @@
   "use strict";
 
   const POWERUP_APP_NAME = "WhatsApp New Message - Mark Read";
-  const POWERUP_APP_KEY = "51604b16c4177e1d0f91ff51797d1348";
+  const POWERUP_APP_KEY = "99fb195773ddc1e3bfbd79de31dd8647";
   const NEW_MESSAGE_LABEL_NAME = "New Message";
 
   function showAuthorization(t) {
