@@ -1,16 +1,18 @@
 /*
  * WhatsApp New Message - Mark Read
- * V6
+ * V7
  *
- * Mark Read is intentionally visible to editable users while testing.
- * The label is checked only after the button is clicked.
+ * Diagnostic/working version.
+ * The Mark Read button is shown to editable users.
+ * Clicking it gives immediate feedback, checks for the New Message label,
+ * authorizes the Power-Up if necessary, and removes the label when authorized.
  */
 
 (function () {
   "use strict";
 
   const POWERUP_APP_NAME = "WhatsApp New Message - Mark Read";
-  const POWERUP_APP_KEY = "51604b16c4177e1d0f91ff51797d1348";
+  const POWERUP_APP_KEY = "99fb195773ddc1e3bfbd79de31dd8647";
   const NEW_MESSAGE_LABEL_NAME = "New Message";
 
   function findNewMessageLabel(card) {
@@ -32,13 +34,13 @@
     return t.popup({
       title: "Authorize Mark Read",
       url: "./authorize.html",
-      height: 200
+      height: 210
     });
   }
 
   function markRead(t) {
-    // Immediate visible feedback proves that the callback itself fired.
-    return t.alert({ message: "Mark Read clicked." })
+    return t
+      .alert({ message: "Mark Read clicked." })
       .then(function () {
         return t.card("id", "labels");
       })
@@ -54,30 +56,24 @@
           });
         }
 
-        return t.getRestApi()
-          .then(function (rest) {
-            return rest.isAuthorized()
-              .then(function (authorized) {
-                if (!authorized) {
-                  return openAuthorization(t);
-                }
-
-                return rest.del(
-                  "/cards/" +
-                    encodeURIComponent(card.id) +
-                    "/idLabels/" +
-                    encodeURIComponent(label.id)
-                );
-              });
-          })
-          .then(function (result) {
-            // Authorization opens a popup and does not remove the label yet.
-            if (result && result !== true) {
-              return result;
+        return t.getRestApi().then(function (rest) {
+          return rest.isAuthorized().then(function (authorized) {
+            if (!authorized) {
+              return openAuthorization(t);
             }
 
-            return t.alert({ message: "Marked as read." });
+            return rest
+              .del(
+                "/cards/" +
+                  encodeURIComponent(card.id) +
+                  "/idLabels/" +
+                  encodeURIComponent(label.id)
+              )
+              .then(function () {
+                return t.alert({ message: "Marked as read." });
+              });
           });
+        });
       })
       .catch(function (error) {
         console.error("[WhatsApp Mark Read] error:", error);

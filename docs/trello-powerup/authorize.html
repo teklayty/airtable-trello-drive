@@ -15,16 +15,15 @@
       "use strict";
 
       const POWERUP_APP_NAME = "WhatsApp New Message - Mark Read";
-      const POWERUP_APP_KEY = "51604b16c4177e1d0f91ff51797d1348";
+      const POWERUP_APP_KEY = "99fb195773ddc1e3bfbd79de31dd8647";
 
       const t = window.TrelloPowerUp.iframe({
         appKey: POWERUP_APP_KEY,
         appName: POWERUP_APP_NAME
       });
 
-      const button = document.getElementById("authorize");
-
-      button.addEventListener("click", function () {
+      document.getElementById("authorize").addEventListener("click", function () {
+        const button = document.getElementById("authorize");
         button.disabled = true;
         button.textContent = "Authorizing...";
 
@@ -36,9 +35,8 @@
             });
           })
           .then(function () {
-            button.textContent = "Authorized";
             return t.alert({
-              message: "Authorization completed. You can close this popup and click Mark Read again."
+              message: "Authorization completed. Close this popup and click Mark Read again."
             });
           })
           .then(function () {
@@ -48,6 +46,7 @@
             console.error("[WhatsApp Mark Read] authorization error:", error);
             button.disabled = false;
             button.textContent = "Authorize";
+
             return t.alert({
               message:
                 "Authorization failed: " +
