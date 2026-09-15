@@ -24,28 +24,34 @@
 
       const button = document.getElementById("authorize");
 
-      button.addEventListener("click", async function () {
+      button.addEventListener("click", function () {
         button.disabled = true;
         button.textContent = "Authorizing...";
 
-        try {
-          const rest = await t.getRestApi();
-          await rest.authorize({
-            scope: "read,write",
-            expiration: "never"
+        t.getRestApi()
+          .then(function (rest) {
+            return rest.authorize({
+              scope: "read,write",
+              expiration: "never"
+            });
+          })
+          .then(function () {
+            button.textContent = "Authorized";
+            return t.alert({
+              message: "Authorization completed. Close this popup and click Mark Read again."
+            });
+          })
+          .then(function () {
+            return t.closePopup();
+          })
+          .catch(function (error) {
+            console.error("[WhatsApp Mark Read] authorization error:", error);
+            button.disabled = false;
+            button.textContent = "Authorize";
+            return t.alert({
+              message: "Authorization was not completed."
+            });
           });
-
-          button.textContent = "Authorized";
-          await t.closePopup();
-          await t.notifyParent("done");
-        } catch (error) {
-          console.error("[WhatsApp Mark Read] authorization error:", error);
-          button.disabled = false;
-          button.textContent = "Authorize";
-          await t.alert({
-            message: "Authorization was not completed."
-          });
-        }
       });
     })();
   </script>

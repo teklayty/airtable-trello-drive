@@ -1,18 +1,33 @@
 /*
  * WhatsApp New Message - Mark Read
  * Trello Power-Up
+ *
+ * The card button is always available to users who can edit the card.
+ * Clicking it:
+ *   1. Checks whether the "New Message" label exists.
+ *   2. Gets the Trello REST API client.
+ *   3. If not authorized, opens a user-clicked authorization popup.
+ *   4. If authorized, removes the label.
  */
 
 (function () {
   "use strict";
 
   const POWERUP_APP_NAME = "WhatsApp New Message - Mark Read";
-  const POWERUP_APP_KEY = "99fb195773ddc1e3bfbd79de31dd8647";
+  const POWERUP_APP_KEY = "51604b16c4177e1d0f91ff51797d1348";
   const NEW_MESSAGE_LABEL_NAME = "New Message";
-  const ICON_URL = "./icon.svg";
+
+  function showAuthorization(t) {
+    return t.popup({
+      title: "Authorize Mark Read",
+      url: "./authorize.html",
+      height: 190
+    });
+  }
 
   function findNewMessageLabel(card) {
     const labels = Array.isArray(card && card.labels) ? card.labels : [];
+
     return (
       labels.find(function (label) {
         return (
@@ -25,78 +40,72 @@
     );
   }
 
-  async function markRead(t) {
-    try {
-      const card = await t.card("id", "labels");
-      const label = findNewMessageLabel(card);
+  function markRead(t) {
+    return Promise.resolve()
+      .then(function () {
+        return t.card("id", "labels");
+      })
+      .then(function (card) {
+        const label = findNewMessageLabel(card);
 
-      if (!label || !label.id) {
-        await t.alert({
-          message:
-            '"' +
-            NEW_MESSAGE_LABEL_NAME +
-            '" is already absent from this card.',
+        if (!label || !label.id) {
+          return t.alert({
+            message:
+              '"' +
+              NEW_MESSAGE_LABEL_NAME +
+              '" is already absent from this card."
+          }).then(function () {
+            return null;
+          });
+        }
+
+        return t.getRestApi().then(function (rest) {
+          return rest.isAuthorized().then(function (authorized) {
+            if (!authorized) {
+              return showAuthorization(t);
+            }
+
+            return rest.del(
+              "/cards/" +
+                encodeURIComponent(card.id) +
+                "/idLabels/" +
+                encodeURIComponent(label.id)
+            ).then(function () {
+              return t.alert({ message: "Marked as read." }).then(function () {
+                if (typeof t.notifyParent === "function") {
+                  return t.notifyParent("done");
+                }
+                return null;
+              });
+            });
+          });
         });
-        return;
-      }
+      })
+      .catch(function (error) {
+        console.error("[WhatsApp Mark Read] error:", error);
 
-      const rest = t.getRestApi();
-
-      if (!(await rest.isAuthorized())) {
-        await rest.authorize({ scope: "read,write" });
-      }
-
-      if (!(await rest.isAuthorized())) {
-        await t.alert({
+        return t.alert({
           message:
-            "Trello authorization was not granted, so the card was not marked as read.",
+            "Could not mark this card as read. Check the browser console for details."
         });
-        return;
-      }
-
-      await rest.del(
-        "/cards/" +
-          encodeURIComponent(card.id) +
-          "/idLabels/" +
-          encodeURIComponent(label.id)
-      );
-
-      await t.alert({ message: "Marked as read." });
-
-      if (typeof t.notifyParent === "function") {
-        t.notifyParent("done");
-      }
-    } catch (error) {
-      console.error("[WhatsApp Mark Read] error:", error);
-      await t.alert({
-        message: "Could not mark this card as read. Please try again.",
       });
-    }
   }
 
   window.TrelloPowerUp.initialize(
     {
-      "card-buttons": function (t, opts) {
-        if (
-          typeof t.memberCanWriteToModel === "function" &&
-          !t.memberCanWriteToModel("card")
-        ) {
-          return [];
-        }
-
+      "card-buttons": function (t) {
         return [
           {
-            icon: ICON_URL,
             text: "Mark Read",
             condition: "edit",
-            callback: markRead,
-          },
+            callback: markRead
+          }
         ];
-      },
+      }
     },
     {
       appKey: POWERUP_APP_KEY,
-      appName: POWERUP_APP_NAME,
+      appName: POWERUP_APP_NAME
     }
   );
 })();
