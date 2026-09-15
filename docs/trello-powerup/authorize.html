@@ -6,7 +6,7 @@
   <title>Authorize Mark Read</title>
 </head>
 <body>
-  <p>Allow this Power-Up to remove the New Message label.</p>
+  <p>Authorize this Power-Up to remove the New Message label.</p>
   <button id="authorize" type="button">Authorize</button>
 
   <script src="https://p.trellocdn.com/power-up.min.js"></script>
@@ -38,7 +38,7 @@
           .then(function () {
             button.textContent = "Authorized";
             return t.alert({
-              message: "Authorization completed. Close this popup and click Mark Read again."
+              message: "Authorization completed. You can close this popup and click Mark Read again."
             });
           })
           .then(function () {
@@ -49,7 +49,9 @@
             button.disabled = false;
             button.textContent = "Authorize";
             return t.alert({
-              message: "Authorization was not completed."
+              message:
+                "Authorization failed: " +
+                (error && error.message ? error.message : String(error))
             });
           });
       });
