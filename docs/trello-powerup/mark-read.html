@@ -11,25 +11,32 @@
       margin: 0;
       padding: 16px;
       color: #172b4d;
+      background: #fff;
     }
 
     #status {
       margin-bottom: 14px;
       line-height: 1.4;
+      font-size: 14px;
     }
 
-    button {
+    #mark-read {
       width: 100%;
       padding: 10px 14px;
       border: 0;
       border-radius: 3px;
       background: #0c66e4;
-      color: white;
+      color: #fff;
       cursor: pointer;
+      font-size: 14px;
       font-weight: 600;
     }
 
-    button:disabled {
+    #mark-read:hover {
+      background: #0055cc;
+    }
+
+    #mark-read:disabled {
       opacity: 0.6;
       cursor: default;
     }
@@ -39,7 +46,7 @@
 <body>
 
   <div id="status">
-    Ready.
+    Click <strong>Mark Read</strong> to remove the "New Message" label.
   </div>
 
   <button id="mark-read" type="button">
@@ -58,11 +65,20 @@
       const POWERUP_APP_KEY =
         "99fb195773ddc1e3bfbd79de31dd8647";
 
-      const NEW_MESSAGE_LABEL_NAME = "New Message";
+      const NEW_MESSAGE_LABEL_NAME =
+        "New Message";
 
-      const status = document.getElementById("status");
-      const button = document.getElementById("mark-read");
+      const status =
+        document.getElementById("status");
 
+      const button =
+        document.getElementById("mark-read");
+
+      /*
+       * This is the secondary Power-Up iframe.
+       * The App Key is required here because this iframe
+       * uses the REST API client.
+       */
       const t = window.TrelloPowerUp.iframe({
         appKey: POWERUP_APP_KEY,
         appName: POWERUP_APP_NAME
@@ -77,23 +93,31 @@
           return null;
         }
 
-        return labels.find(function (label) {
-          return (
-            label &&
-            typeof label.name === "string" &&
-            label.name.trim().toLowerCase() ===
-              NEW_MESSAGE_LABEL_NAME.toLowerCase()
-          );
-        }) || null;
+        return (
+          labels.find(function (label) {
+            return (
+              label &&
+              typeof label.name === "string" &&
+              label.name.trim().toLowerCase() ===
+                NEW_MESSAGE_LABEL_NAME.toLowerCase()
+            );
+          }) || null
+        );
       }
 
-      async function markRead() {
+      async function run() {
         button.disabled = true;
+        setStatus("Checking the card...");
 
         try {
-          setStatus("Reading card information...");
-
-          const card = await t.card("id", "name", "labels");
+          /*
+           * Get the current card and its labels.
+           */
+          const card = await t.card(
+            "id",
+            "name",
+            "labels"
+          );
 
           if (!card || !card.id) {
             throw new Error(
@@ -101,50 +125,139 @@
             );
           }
 
-          const label = findNewMessageLabel(card.labels);
+          const label =
+            findNewMessageLabel(card.labels);
 
           if (!label || !label.id) {
             setStatus(
-              'The "New Message" label is not present on this card.'
+              'The "New Message" label is already absent from this card.'
             );
+
             button.disabled = false;
             return;
           }
 
-          setStatus("Checking authorization...");
+          /*
+           * Get Trello's REST API client.
+           */
+          setStatus(
+            "Checking Trello authorization..."
+          );
 
-          const rest = await t.getRestApi();
+          const rest =
+            await t.getRestApi();
 
-          const authorized = await rest.isAuthorized();
+          /*
+           * See whether this Power-Up has already
+           * been authorized by the current member.
+           */
+          let authorized =
+            await rest.isAuthorized();
 
+          /*
+           * Authorization must be initiated as a
+           * consequence of this actual user click.
+           */
           if (!authorized) {
-            setStatus("Authorization required...");
+            setStatus(
+              "Opening Trello authorization..."
+            );
 
-            /*
-             * IMPORTANT:
-             * This authorization call happens directly from
-             * the user's click on this button.
-             */
             await rest.authorize({
               scope: "read,write",
               expiration: "never"
             });
+
+            authorized =
+              await rest.isAuthorized();
           }
 
-          setStatus('Removing "New Message"...');
+          if (!authorized) {
+            throw new Error(
+              "Trello authorization was not completed."
+            );
+          }
 
-          await rest.del(
-            "/cards/" +
-              encodeURIComponent(card.id) +
-              "/idLabels/" +
-              encodeURIComponent(label.id)
+          /*
+           * Retrieve the user token.
+           */
+          setStatus(
+            "Getting Trello authorization token..."
           );
 
-          setStatus("Marked as read.");
-          button.textContent = "Done";
+          const token =
+            await rest.getToken();
 
-          if (typeof t.notifyParent === "function") {
-            await t.notifyParent("done");
+          if (!token) {
+            throw new Error(
+              "Trello authorization succeeded, but no token was returned."
+            );
+          }
+
+          /*
+           * Remove the New Message label using
+           * Trello's REST API directly.
+           *
+           * Trello documents:
+           *
+           * DELETE /cards/{id}/idLabels/{idLabel}
+           */
+          setStatus(
+            'Removing "New Message"...'
+          );
+
+          const url =
+            "https://api.trello.com/1/cards/" +
+            encodeURIComponent(card.id) +
+            "/idLabels/" +
+            encodeURIComponent(label.id) +
+            "?key=" +
+            encodeURIComponent(POWERUP_APP_KEY) +
+            "&token=" +
+            encodeURIComponent(token);
+
+          const response =
+            await fetch(url, {
+              method: "DELETE"
+            });
+
+          if (!response.ok) {
+            let details = "";
+
+            try {
+              details =
+                await response.text();
+            } catch (_) {
+              // Ignore response-body parsing failure.
+            }
+
+            throw new Error(
+              "Trello API returned HTTP " +
+                response.status +
+                (details ? ": " + details : "")
+            );
+          }
+
+          /*
+           * Success.
+           */
+          setStatus(
+            "Marked as read."
+          );
+
+          button.textContent =
+            "Done";
+
+          /*
+           * Tell Trello to refresh the parent UI.
+           */
+          if (
+            typeof t.notifyParent ===
+            "function"
+          ) {
+            await t.notifyParent(
+              "done"
+            );
           }
 
         } catch (error) {
@@ -155,18 +268,23 @@
 
           setStatus(
             "Error: " +
-            (
-              error && error.message
-                ? error.message
-                : String(error)
-            )
+              (
+                error &&
+                error.message
+                  ? error.message
+                  : String(error)
+              )
           );
 
           button.disabled = false;
         }
       }
 
-      button.addEventListener("click", markRead);
+      button.addEventListener(
+        "click",
+        run
+      );
+
     })();
   </script>
 
