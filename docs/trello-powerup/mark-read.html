@@ -11,32 +11,25 @@
       margin: 0;
       padding: 16px;
       color: #172b4d;
-      background: #fff;
     }
 
     #status {
       margin-bottom: 14px;
       line-height: 1.4;
-      font-size: 14px;
     }
 
-    #mark-read {
+    button {
       width: 100%;
       padding: 10px 14px;
       border: 0;
       border-radius: 3px;
       background: #0c66e4;
-      color: #fff;
+      color: white;
       cursor: pointer;
-      font-size: 14px;
       font-weight: 600;
     }
 
-    #mark-read:hover {
-      background: #0055cc;
-    }
-
-    #mark-read:disabled {
+    button:disabled {
       opacity: 0.6;
       cursor: default;
     }
@@ -46,7 +39,7 @@
 <body>
 
   <div id="status">
-    Click <strong>Mark Read</strong> to remove the "New Message" label.
+    Ready.
   </div>
 
   <button id="mark-read" type="button">
@@ -59,8 +52,12 @@
     (function () {
       "use strict";
 
-      const POWERUP_APP_NAME = "WhatsApp New Message - Mark Read";
-      const POWERUP_APP_KEY = "99fb195773ddc1e3bfbd79de31dd8647";
+      const POWERUP_APP_NAME =
+        "WhatsApp New Message - Mark Read";
+
+      const POWERUP_APP_KEY =
+        "99fb195773ddc1e3bfbd79de31dd8647";
+
       const NEW_MESSAGE_LABEL_NAME = "New Message";
 
       const status = document.getElementById("status");
@@ -80,69 +77,58 @@
           return null;
         }
 
-        return (
-          labels.find(function (label) {
-            return (
-              label &&
-              typeof label.name === "string" &&
-              label.name.trim().toLowerCase() ===
-                NEW_MESSAGE_LABEL_NAME.toLowerCase()
-            );
-          }) || null
-        );
+        return labels.find(function (label) {
+          return (
+            label &&
+            typeof label.name === "string" &&
+            label.name.trim().toLowerCase() ===
+              NEW_MESSAGE_LABEL_NAME.toLowerCase()
+          );
+        }) || null;
       }
 
-      async function run() {
+      async function markRead() {
         button.disabled = true;
-        setStatus("Checking the card...");
 
         try {
+          setStatus("Reading card information...");
+
           const card = await t.card("id", "name", "labels");
 
           if (!card || !card.id) {
-            throw new Error("Could not determine the current Trello card.");
+            throw new Error(
+              "Could not determine the current Trello card."
+            );
           }
 
           const label = findNewMessageLabel(card.labels);
 
           if (!label || !label.id) {
             setStatus(
-              'The "New Message" label is already absent from this card.'
+              'The "New Message" label is not present on this card.'
             );
             button.disabled = false;
             return;
           }
 
-          /*
-           * getRestApi() returns a Promise.
-           */
-          setStatus("Connecting to Trello...");
+          setStatus("Checking authorization...");
 
           const rest = await t.getRestApi();
 
-          /*
-           * Check whether this member has already authorized
-           * the Power-Up.
-           */
-          let authorized = await rest.isAuthorized();
+          const authorized = await rest.isAuthorized();
 
-          /*
-           * This call is reached directly from the user's click
-           * on the Mark Read button inside this popup.
-           */
           if (!authorized) {
-            setStatus("Opening Trello authorization...");
+            setStatus("Authorization required...");
 
+            /*
+             * IMPORTANT:
+             * This authorization call happens directly from
+             * the user's click on this button.
+             */
             await rest.authorize({
               scope: "read,write",
               expiration: "never"
             });
-
-            authorized = await rest.isAuthorized();
-          }
-
-          if (!authorized) {
-            throw new Error("Trello authorization was not completed.");
           }
 
           setStatus('Removing "New Message"...');
@@ -162,22 +148,25 @@
           }
 
         } catch (error) {
-          console.error("[WhatsApp Mark Read] error:", error);
+          console.error(
+            "[WhatsApp Mark Read] error:",
+            error
+          );
 
           setStatus(
             "Error: " +
-              (
-                error && error.message
-                  ? error.message
-                  : String(error)
-              )
+            (
+              error && error.message
+                ? error.message
+                : String(error)
+            )
           );
 
           button.disabled = false;
         }
       }
 
-      button.addEventListener("click", run);
+      button.addEventListener("click", markRead);
     })();
   </script>
 
