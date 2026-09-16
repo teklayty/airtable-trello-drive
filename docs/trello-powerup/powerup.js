@@ -1,11 +1,20 @@
-window.TrelloPowerUp.initialize({
-  "card-buttons": function (t, opts) {
-    console.log("MARK READ TEST: card-buttons called", opts);
+(function () {
+  "use strict";
 
-    return [
-      {
-        text: "MARK READ TEST"
-      }
-    ];
-  }
-});
+  window.TrelloPowerUp.initialize({
+    "card-buttons": function () {
+      return [
+        {
+          text: "Mark Read",
+          callback: function (t) {
+            return t.popup({
+              title: "Mark Read",
+              url: "https://teklayty.github.io/airtable-trello-drive/trello-powerup/mark-read-test.html",
+              height: 180
+            });
+          }
+        }
+      ];
+    }
+  });
+})();
