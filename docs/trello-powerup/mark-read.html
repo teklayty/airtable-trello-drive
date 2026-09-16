@@ -66,10 +66,6 @@
       const status = document.getElementById("status");
       const button = document.getElementById("mark-read");
 
-      /*
-       * This is a secondary Power-Up iframe, so this is where the
-       * App Key is used.
-       */
       const t = window.TrelloPowerUp.iframe({
         appKey: POWERUP_APP_KEY,
         appName: POWERUP_APP_NAME
@@ -101,9 +97,6 @@
         setStatus("Checking the card...");
 
         try {
-          /*
-           * Get the current card and its labels.
-           */
           const card = await t.card("id", "name", "labels");
 
           if (!card || !card.id) {
@@ -116,25 +109,27 @@
             setStatus(
               'The "New Message" label is already absent from this card.'
             );
-
             button.disabled = false;
             return;
           }
 
           /*
-           * Get the Trello REST API client.
+           * getRestApi() returns a Promise.
            */
-          setStatus("Checking Trello authorization...");
+          setStatus("Connecting to Trello...");
 
           const rest = await t.getRestApi();
 
           /*
-           * Authorization must happen from a user click.
-           * This function is called directly by the button click,
-           * so it is safe to start the Trello consent flow here.
+           * Check whether this member has already authorized
+           * the Power-Up.
            */
           let authorized = await rest.isAuthorized();
 
+          /*
+           * This call is reached directly from the user's click
+           * on the Mark Read button inside this popup.
+           */
           if (!authorized) {
             setStatus("Opening Trello authorization...");
 
@@ -147,14 +142,9 @@
           }
 
           if (!authorized) {
-            throw new Error(
-              "Trello authorization was not completed."
-            );
+            throw new Error("Trello authorization was not completed.");
           }
 
-          /*
-           * Remove the New Message label.
-           */
           setStatus('Removing "New Message"...');
 
           await rest.del(
@@ -164,24 +154,15 @@
               encodeURIComponent(label.id)
           );
 
-          /*
-           * Confirm success to the user.
-           */
           setStatus("Marked as read.");
           button.textContent = "Done";
 
-          /*
-           * Tell the parent Trello UI that the popup action is complete.
-           */
           if (typeof t.notifyParent === "function") {
             await t.notifyParent("done");
           }
 
         } catch (error) {
-          console.error(
-            "[WhatsApp Mark Read] error:",
-            error
-          );
+          console.error("[WhatsApp Mark Read] error:", error);
 
           setStatus(
             "Error: " +
@@ -196,10 +177,6 @@
         }
       }
 
-      /*
-       * IMPORTANT:
-       * Authorization is reached from this actual user click.
-       */
       button.addEventListener("click", run);
     })();
   </script>

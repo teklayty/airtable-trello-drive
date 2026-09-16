@@ -2,18 +2,15 @@
   "use strict";
 
   window.TrelloPowerUp.initialize({
-    "card-buttons": function (t, opts) {
+    "card-buttons": function () {
       return [
         {
           text: "Mark Read",
-          callback: function (t, opts) {
+          callback: function (t) {
             return t.popup({
               title: "Mark Read",
-              items: [
-                {
-                  text: "BUTTON CALLBACK IS WORKING"
-                }
-              ]
+              url: "./mark-read.html",
+              height: 220
             });
           }
         }
