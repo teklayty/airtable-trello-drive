@@ -2,15 +2,18 @@
   "use strict";
 
   window.TrelloPowerUp.initialize({
-    "card-buttons": function () {
+    "card-buttons": function (t, opts) {
       return [
         {
           text: "Mark Read",
-          callback: function (t) {
+          callback: function (t, opts) {
             return t.popup({
               title: "Mark Read",
-              url: "https://teklayty.github.io/airtable-trello-drive/trello-powerup/mark-read-test.html",
-              height: 180
+              items: [
+                {
+                  text: "BUTTON CALLBACK IS WORKING"
+                }
+              ]
             });
           }
         }
