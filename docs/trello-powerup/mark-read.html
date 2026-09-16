@@ -4,20 +4,57 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Mark Read</title>
+
   <style>
-    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-           margin: 0; padding: 16px; }
-    button { width: 100%; padding: 9px 12px; border: 0; border-radius: 3px;
-             cursor: pointer; background: #0c66e4; color: #fff; font-weight: 600; }
-    button:disabled { opacity: 0.6; cursor: default; }
-    #status { margin-bottom: 12px; line-height: 1.35; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      margin: 0;
+      padding: 16px;
+      color: #172b4d;
+      background: #fff;
+    }
+
+    #status {
+      margin-bottom: 14px;
+      line-height: 1.4;
+      font-size: 14px;
+    }
+
+    #mark-read {
+      width: 100%;
+      padding: 10px 14px;
+      border: 0;
+      border-radius: 3px;
+      background: #0c66e4;
+      color: #fff;
+      cursor: pointer;
+      font-size: 14px;
+      font-weight: 600;
+    }
+
+    #mark-read:hover {
+      background: #0055cc;
+    }
+
+    #mark-read:disabled {
+      opacity: 0.6;
+      cursor: default;
+    }
   </style>
 </head>
+
 <body>
-  <div id="status">Click the button to mark this card as read.</div>
-  <button id="mark-read" type="button">Mark Read</button>
+
+  <div id="status">
+    Click <strong>Mark Read</strong> to remove the "New Message" label.
+  </div>
+
+  <button id="mark-read" type="button">
+    Mark Read
+  </button>
 
   <script src="https://p.trellocdn.com/power-up.min.js"></script>
+
   <script>
     (function () {
       "use strict";
@@ -26,16 +63,37 @@
       const POWERUP_APP_KEY = "99fb195773ddc1e3bfbd79de31dd8647";
       const NEW_MESSAGE_LABEL_NAME = "New Message";
 
+      const status = document.getElementById("status");
+      const button = document.getElementById("mark-read");
+
+      /*
+       * This is a secondary Power-Up iframe, so this is where the
+       * App Key is used.
+       */
       const t = window.TrelloPowerUp.iframe({
         appKey: POWERUP_APP_KEY,
         appName: POWERUP_APP_NAME
       });
 
-      const status = document.getElementById("status");
-      const button = document.getElementById("mark-read");
+      function setStatus(message) {
+        status.textContent = message;
+      }
 
-      function setStatus(text) {
-        status.textContent = text;
+      function findNewMessageLabel(labels) {
+        if (!Array.isArray(labels)) {
+          return null;
+        }
+
+        return (
+          labels.find(function (label) {
+            return (
+              label &&
+              typeof label.name === "string" &&
+              label.name.trim().toLowerCase() ===
+                NEW_MESSAGE_LABEL_NAME.toLowerCase()
+            );
+          }) || null
+        );
       }
 
       async function run() {
@@ -43,42 +101,61 @@
         setStatus("Checking the card...");
 
         try {
-          const card = await t.card("id", "labels");
-          const labels = Array.isArray(card.labels) ? card.labels : [];
-          const label = labels.find(function (item) {
-            return item &&
-              typeof item.name === "string" &&
-              item.name.trim().toLowerCase() ===
-                NEW_MESSAGE_LABEL_NAME.toLowerCase();
-          });
+          /*
+           * Get the current card and its labels.
+           */
+          const card = await t.card("id", "name", "labels");
+
+          if (!card || !card.id) {
+            throw new Error("Could not determine the current Trello card.");
+          }
+
+          const label = findNewMessageLabel(card.labels);
 
           if (!label || !label.id) {
-            setStatus('The "New Message" label is already absent.');
+            setStatus(
+              'The "New Message" label is already absent from this card.'
+            );
+
             button.disabled = false;
             return;
           }
 
-          setStatus("Checking authorization...");
+          /*
+           * Get the Trello REST API client.
+           */
+          setStatus("Checking Trello authorization...");
 
           const rest = await t.getRestApi();
+
+          /*
+           * Authorization must happen from a user click.
+           * This function is called directly by the button click,
+           * so it is safe to start the Trello consent flow here.
+           */
           let authorized = await rest.isAuthorized();
 
           if (!authorized) {
-            setStatus("Authorization is required. Please complete the Trello authorization popup.");
+            setStatus("Opening Trello authorization...");
+
             await rest.authorize({
               scope: "read,write",
               expiration: "never"
             });
+
             authorized = await rest.isAuthorized();
           }
 
           if (!authorized) {
-            setStatus("Authorization was not completed.");
-            button.disabled = false;
-            return;
+            throw new Error(
+              "Trello authorization was not completed."
+            );
           }
 
-          setStatus("Removing the New Message label...");
+          /*
+           * Remove the New Message label.
+           */
+          setStatus('Removing "New Message"...');
 
           await rest.del(
             "/cards/" +
@@ -87,21 +164,45 @@
               encodeURIComponent(label.id)
           );
 
+          /*
+           * Confirm success to the user.
+           */
           setStatus("Marked as read.");
           button.textContent = "Done";
-          await t.notifyParent("done");
+
+          /*
+           * Tell the parent Trello UI that the popup action is complete.
+           */
+          if (typeof t.notifyParent === "function") {
+            await t.notifyParent("done");
+          }
+
         } catch (error) {
-          console.error("[WhatsApp Mark Read] error:", error);
+          console.error(
+            "[WhatsApp Mark Read] error:",
+            error
+          );
+
           setStatus(
             "Error: " +
-              (error && error.message ? error.message : String(error))
+              (
+                error && error.message
+                  ? error.message
+                  : String(error)
+              )
           );
+
           button.disabled = false;
         }
       }
 
+      /*
+       * IMPORTANT:
+       * Authorization is reached from this actual user click.
+       */
       button.addEventListener("click", run);
     })();
   </script>
+
 </body>
 </html>
