@@ -3132,6 +3132,13 @@ def add_new_message_label_to_card(card_id):
 # ============================================================
 
 
+def _strip_trailing_whatsapp_word(value):
+    text = str(value or "").strip()
+    if text.lower().endswith(" whatsapp"):
+        text = text[:-9].rstrip()
+    return text or "WhatsApp"
+
+
 def trello_comment_already_exists(card_id, comment_text, limit=100):
     """Return True when an equivalent WhatsApp comment is already on the card.
 
@@ -3147,9 +3154,52 @@ def trello_comment_already_exists(card_id, comment_text, limit=100):
 
     def whatsapp_base(value):
         text = str(value or "").strip()
-        # Keep the WhatsApp direction/account/phone header, but remove the
-        # generated attachment block from the comparison fingerprint.
+        # Remove the generated attachment block from the comparison fingerprint.
         text = re.sub(r"\n+📎 Attachments:.*$", "", text, flags=re.S)
+
+        lines = text.split("\n\n", 1)
+        header = lines[0].strip() if lines else ""
+        body = lines[1].strip() if len(lines) > 1 else ""
+
+        # Current format:
+        # **Spring3 (From: 447393698631) — 09/09/2026 13:34**
+        match = re.match(
+            r"^\*\*(.*?) \((From|To):\s*([^)]+)\)\s*(?:—\s*[^*]+)?\*\*$",
+            header,
+            flags=re.I,
+        )
+        if match:
+            account, role, peer = match.groups()
+            return normalize_comment(
+                f"WhatsApp|{account}|{role.lower()}|{peer}|{body}"
+            )
+
+        # Legacy format:
+        # WhatsApp message (Spring3 WhatsApp) FROM 447393698631:
+        match = re.match(
+            r"^WhatsApp message \((.*?)\)\s+(FROM|TO)\s+([^:]+):$",
+            header,
+            flags=re.I,
+        )
+        if match:
+            account, role, peer = match.groups()
+            account = _strip_trailing_whatsapp_word(account)
+            return normalize_comment(
+                f"WhatsApp|{account}|{role.lower()}|{peer.strip()}|{body}"
+            )
+
+        # Legacy format without a phone.
+        match = re.match(
+            r"^WhatsApp message \((.*?)\):$",
+            header,
+            flags=re.I,
+        )
+        if match:
+            account = _strip_trailing_whatsapp_word(match.group(1))
+            return normalize_comment(
+                f"WhatsApp|{account}|unknown||{body}"
+            )
+
         return normalize_comment(text)
 
     target_exact = str(comment_text).strip()
@@ -3189,34 +3239,135 @@ def trello_comment_already_exists(card_id, comment_text, limit=100):
     return False
 
 
+AIRTABLE_COMMENT_MARKER = "📌**SU AIRTABLE Record and Drive Docs**"
+
+
+def promote_airtable_comment_to_top(card_id):
+    """Keep the Airtable sync comment as the newest/top Trello comment.
+
+    Trello does not expose a comment-reordering API. The reliable way to move
+    the Airtable-owned comment back to the top is to delete and recreate that
+    same comment after a WhatsApp comment has been posted.
+    """
+    try:
+        actions = trello_request(
+            "GET",
+            f"/cards/{card_id}/actions",
+            {
+                "filter": "commentCard",
+                "limit": "1000",
+                "fields": "data,date,type",
+            },
+        ) or []
+
+        airtable_action = None
+        for action in actions:
+            text = ((action.get("data") or {}).get("text") or "").strip()
+            if AIRTABLE_COMMENT_MARKER in text:
+                airtable_action = action
+                break
+
+        if not airtable_action:
+            return False
+
+        action_id = airtable_action.get("id")
+        comment_text = ((airtable_action.get("data") or {}).get("text") or "").strip()
+        if not action_id or not comment_text:
+            return False
+
+        # /actions returns newest first. If the Airtable comment is already
+        # the first comment action, it is already at the top and nothing needs
+        # to be changed.
+        first_action = actions[0] if actions else None
+        if first_action and first_action.get("id") == action_id:
+            return False
+
+        trello_request("DELETE", f"/actions/{action_id}")
+        trello_request(
+            "POST",
+            f"/cards/{card_id}/actions/comments",
+            {"text": comment_text},
+        )
+
+        logger.info(
+            "[TRELLO] Promoted Airtable sync comment to top of card %s after WhatsApp comment.",
+            card_id,
+        )
+        return True
+
+    except Exception as exc:
+        logger.warning(
+            "[TRELLO] Could not promote Airtable sync comment to top for card %s: %s",
+            card_id,
+            exc,
+        )
+        return False
+
+
+def _short_whatsapp_account_name(account_name):
+    """Return the concise account title used in Trello WhatsApp headers."""
+    return _strip_trailing_whatsapp_word(account_name)
+
+
+def _format_whatsapp_trello_timestamp(timestamp):
+    """Return WhatsApp's timestamp as a compact, human-readable date/time."""
+    text = str(timestamp or "").strip()
+    if not text:
+        return ""
+
+    match = re.search(
+        r"(\d{1,2}:\d{2}),\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})",
+        text,
+    )
+    if match:
+        time_part = match.group(1).zfill(5)
+        date_part = match.group(2)
+        return f"{date_part} {time_part}"
+
+    match = re.search(r"(\d{1,2}:\d{2})", text)
+    if match:
+        return match.group(1).zfill(5)
+
+    return text.strip("[] ")
+
+
+def _format_whatsapp_trello_header(
+    whatsapp_account, phone=None, direction="incoming", timestamp=None
+):
+    """Build the bold Trello header for one WhatsApp message."""
+    account_name = WHATSAPP_ACCOUNTS.get(whatsapp_account, {}).get(
+        "name", whatsapp_account
+    )
+    short_name = _short_whatsapp_account_name(account_name)
+    role = "To" if direction == "outgoing" else "From"
+
+    if phone:
+        header = f"{short_name} ({role}: {phone})"
+    else:
+        header = short_name
+
+    timestamp_display = _format_whatsapp_trello_timestamp(timestamp)
+    if timestamp_display:
+        header += f" — {timestamp_display}"
+
+    return f"**{header}**"
+
+
 def add_trello_comment(
     card_id,
     message,
     phone=None,
     whatsapp_account=None,
     direction="incoming",
+    timestamp=None,
 ):
-    account_name = WHATSAPP_ACCOUNTS.get(whatsapp_account, {}).get(
-        "name", whatsapp_account
+    header = _format_whatsapp_trello_header(
+        whatsapp_account=whatsapp_account,
+        phone=phone,
+        direction=direction,
+        timestamp=timestamp,
     )
-
-    if direction == "outgoing":
-        if phone:
-            comment = (
-                f"WhatsApp message ({account_name}) TO {phone}:\n\n{message}"
-            )
-
-        else:
-            comment = f"WhatsApp message ({account_name}) TO client:\n\n{message}"
-
-    else:
-        if phone:
-            comment = (
-                f"WhatsApp message ({account_name}) FROM {phone}:\n\n{message}"
-            )
-
-        else:
-            comment = f"WhatsApp message ({account_name}):\n\n{message}"
+    comment = f"{header}\n\n{message}"
 
     if trello_comment_already_exists(card_id, comment):
         logger.info(
@@ -3230,6 +3381,11 @@ def add_trello_comment(
         "POST", f"/cards/{card_id}/actions/comments", {"text": comment}
     )
 
+    # Trello shows comment actions newest-first. Recreate the Airtable-owned
+    # comment immediately after each real WhatsApp POST so the Airtable block
+    # remains the first/top comment, with WhatsApp messages underneath it.
+    promote_airtable_comment_to_top(card_id)
+
     if direction == "incoming":
         add_new_message_label_to_card(card_id)
 
@@ -3237,7 +3393,12 @@ def add_trello_comment(
 
 
 def update_client_trello_card_from_whatsapp(
-    whatsapp_account, contact, message, direction="incoming", attachments=None
+    whatsapp_account,
+    contact,
+    message,
+    direction="incoming",
+    attachments=None,
+    timestamp=None,
 ):
     """Posts a WhatsApp message (and optional attachment details) to the client's Trello card."""
     card_id = contact.get("trello_card_id")
@@ -3273,6 +3434,7 @@ def update_client_trello_card_from_whatsapp(
             phone=phone,
             whatsapp_account=whatsapp_account,
             direction=direction,
+            timestamp=timestamp,
         )
         # The 'New Message' label is intentionally NOT removed here.
         # It remains until the human opens/reads the Trello card.
@@ -6730,6 +6892,7 @@ def _process_message_claimed(
         message=message,
         direction=direction,
         attachments=attachments,
+        timestamp=timestamp,
     )
 
     logger.info(

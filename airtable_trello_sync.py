@@ -377,6 +377,29 @@ def get_airtable_comment_actions(card_id):
     return owned
 
 
+def get_card_comment_actions(card_id):
+    """Return recent comment actions for a card, newest first."""
+    return trello_get(
+        f"/cards/{card_id}/actions",
+        {
+            "filter": "commentCard",
+            "limit": 1000,
+        }
+    )
+
+
+def get_latest_non_airtable_comment(card_id):
+    """Return the newest non-Airtable comment action, if one exists."""
+    actions = get_card_comment_actions(card_id)
+
+    for action in actions:
+        text = action.get("data", {}).get("text", "") or ""
+        if AIRTABLE_COMMENT_MARKER not in text:
+            return action
+
+    return None
+
+
 def delete_airtable_comments(card_id, keep_action_id=None):
     """Delete duplicate Airtable-sync comments only.
 
@@ -404,6 +427,25 @@ def delete_airtable_comments(card_id, keep_action_id=None):
             )
 
 
+def delete_airtable_comment(card_id, action_id):
+    """Delete one specific Airtable-owned comment."""
+    if not action_id:
+        return
+
+    try:
+        trello_delete(f"/actions/{action_id}")
+        log(
+            f"Deleted Airtable sync comment {action_id} from card {card_id} "
+            "to promote it back to the top of the comment feed"
+        )
+    except Exception as e:
+        log(
+            f"Could not delete Airtable sync comment {action_id}: {e}",
+            "error"
+        )
+        raise
+
+
 def update_airtable_comment(action_id, comment_text):
     """Update an existing Airtable-owned Trello comment in place."""
     r = trello_put(
@@ -411,6 +453,15 @@ def update_airtable_comment(action_id, comment_text):
         {"text": comment_text}
     )
     return r
+
+
+def create_airtable_comment(card_id, comment_text):
+    """Create a new Airtable-owned comment and return the Trello action."""
+    result = trello_post(
+        f"/cards/{card_id}/actions/comments",
+        {"text": comment_text}
+    )
+    return result
 
 
 def add_comment(
@@ -424,7 +475,6 @@ def add_comment(
     fullname
 ):
 
-    
     # Only manage the Airtable-owned comment.
     # Preserve WhatsApp/operator/manual comments on the same Trello card.
     existing_airtable_comments = get_airtable_comment_actions(card_id)
@@ -443,10 +493,9 @@ def add_comment(
     notes_link = build_notes_link(record_id)
     form_link = build_prefill_form_link(fullname, record_id)
 
-    lines = [AIRTABLE_COMMENT_MARKER ]
+    lines = [AIRTABLE_COMMENT_MARKER]
 
-    if coss_notes and str(coss_notes).strip():
-        lines.append(f"🟦 CoSS Notes:\n{notes_link}\n")
+    lines.append(f"🟦 CoSS Notes:\n{notes_link}\n")
 
     if scc_notes and str(scc_notes).strip():
         lines.append(f"🟨 SCC Notes:\n{notes_link}\n")
@@ -461,8 +510,6 @@ def add_comment(
             f"📁 Client Documents:\n{gdrive}"
         )
 
-    
-
     if drive_links:
         lines.append("")
         lines.extend(drive_links)
@@ -475,25 +522,48 @@ def add_comment(
 
     comment_text = "\n".join(lines)
 
-    log("ABOUT TO POST COMMENT")
+    log("ABOUT TO POST/UPDATE COMMENT")
     log(comment_text)
 
+    # Trello's comment actions are ordered newest first.  If a WhatsApp or
+    # other non-Airtable comment was added after our Airtable comment, recreate
+    # the Airtable comment so it becomes the newest/top comment again.
+    promote_to_top = False
     if keep_action_id:
+        try:
+            latest_non_airtable = get_latest_non_airtable_comment(card_id)
+            airtable_date = existing_airtable_comments[0].get("date", "")
+            latest_other_date = (latest_non_airtable or {}).get("date", "")
+
+            if latest_other_date and (not airtable_date or latest_other_date > airtable_date):
+                promote_to_top = True
+                log(
+                    f"PROMOTING AIRTABLE COMMENT TO TOP: card={card_id} "
+                    f"airtable_date={airtable_date} "
+                    f"latest_other_date={latest_other_date}"
+                )
+        except Exception as e:
+            log(
+                f"Could not determine whether Airtable comment needs promotion "
+                f"on card {card_id}: {e}",
+                "warning"
+            )
+
+    if promote_to_top:
+        delete_airtable_comment(card_id, keep_action_id)
+        create_airtable_comment(card_id, comment_text)
+        log("AIRTABLE COMMENT RECREATED AT TOP")
+    elif keep_action_id:
         update_airtable_comment(keep_action_id, comment_text)
         log(
             f"AIRTABLE COMMENT UPDATED IN PLACE "
             f"action={keep_action_id}"
         )
     else:
-        trello_post(
-            f"/cards/{card_id}/actions/comments",
-            {"text": comment_text}
-        )
+        create_airtable_comment(card_id, comment_text)
         log("AIRTABLE COMMENT CREATED")
 
     log("COMMENT SYNC SUCCESSFUL")
-
-
 
 
 def generate_note_links(record_id, coss_notes, scc_notes, cas_notes):
