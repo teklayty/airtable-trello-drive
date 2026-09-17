@@ -7,6 +7,7 @@ import logging
 import urllib.parse
 import json
 import base64
+import time
 
 
 # =========================================================
@@ -50,6 +51,33 @@ AIRTABLE_NOTES_PARAM = os.getenv(
 # Marker used so the Airtable sync can update only its own Trello comment.
 # Comments created by WhatsApp, operators, or other systems are preserved.
 AIRTABLE_COMMENT_MARKER = f"📌**SU AIRTABLE Record and Drive Docs**"
+
+# Temporary root folder currently used for SPRING client documents.
+# This is informational only: we do NOT use the root folder as a substitute
+# for a missing client-specific Link value in Airtable.
+GOOGLE_DRIVE_ROOT_FOLDER_ID = os.getenv(
+    "GOOGLE_DRIVE_ROOT_FOLDER_ID",
+    "17QIHfTwZtPAv3o3Nhur4AOYJzq8e13So"
+)
+GOOGLE_DRIVE_ROOT_FOLDER_URL = (
+    "https://drive.google.com/drive/folders/"
+    f"{GOOGLE_DRIVE_ROOT_FOLDER_ID}?usp=drive_link"
+)
+
+# Optional Google Drive access used only to determine whether a linked client
+# folder actually contains anything. Prefer a service-account JSON file; an
+# API key can be used only where the folder is accessible as public data.
+GOOGLE_DRIVE_CREDENTIALS_FILE = os.getenv(
+    "GOOGLE_DRIVE_CREDENTIALS_FILE",
+    os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "")
+)
+GOOGLE_DRIVE_API_KEY = os.getenv("GOOGLE_DRIVE_API_KEY", "")
+GOOGLE_DRIVE_TOKEN_URL = "https://oauth2.googleapis.com/token"
+GOOGLE_DRIVE_FILES_URL = "https://www.googleapis.com/drive/v3/files"
+GOOGLE_DRIVE_SCOPE = "https://www.googleapis.com/auth/drive.readonly"
+
+DRIVE_NO_LINK_LABEL = "No Drive Link"
+DRIVE_FOLDER_EMPTY_LABEL = "Drive Folder Empty"
 
 
 TODAY = datetime.now()
@@ -177,6 +205,231 @@ def generate_interface_link(record_id):
 # =========================================================
 # LABELING CARDS IF NO REFERRAL TO COUNCIL
 # =========================================================
+def extract_drive_folder_id(value):
+    """Extract a Google Drive folder ID from a client Drive URL."""
+    if not value:
+        return ""
+
+    value = str(value).strip()
+    if not value:
+        return ""
+
+    patterns = (
+        r"drive\.google\.com/drive/folders/([a-zA-Z0-9_-]+)",
+        r"[?&]id=([a-zA-Z0-9_-]+)",
+    )
+
+    for pattern in patterns:
+        match = re.search(pattern, value)
+        if match:
+            return match.group(1)
+
+    return ""
+
+
+_drive_access_token = None
+_drive_access_token_expires_at = 0
+
+
+def get_google_drive_access_token():
+    """Return a short-lived Google Drive API access token, when configured."""
+    global _drive_access_token, _drive_access_token_expires_at
+
+    now = int(time.time())
+    if _drive_access_token and now < (_drive_access_token_expires_at - 60):
+        return _drive_access_token
+
+    credentials_file = GOOGLE_DRIVE_CREDENTIALS_FILE.strip()
+    if not credentials_file:
+        return ""
+
+    try:
+        with open(credentials_file, "r", encoding="utf-8") as fh:
+            credentials = json.load(fh)
+
+        client_email = credentials.get("client_email")
+        private_key = credentials.get("private_key")
+        if not client_email or not private_key:
+            log(
+                "Google Drive credentials file is missing client_email or private_key",
+                "warning"
+            )
+            return ""
+
+        try:
+            import jwt
+        except ImportError:
+            log(
+                "PyJWT is not installed; cannot authenticate to Google Drive API",
+                "warning"
+            )
+            return ""
+
+        issued_at = now
+        payload = {
+            "iss": client_email,
+            "scope": GOOGLE_DRIVE_SCOPE,
+            "aud": GOOGLE_DRIVE_TOKEN_URL,
+            "iat": issued_at,
+            "exp": issued_at + 3600,
+        }
+
+        assertion = jwt.encode(payload, private_key, algorithm="RS256")
+
+        response = requests.post(
+            GOOGLE_DRIVE_TOKEN_URL,
+            data={
+                "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+                "assertion": assertion,
+            },
+            timeout=30,
+        )
+        response.raise_for_status()
+        token_data = response.json()
+
+        _drive_access_token = token_data.get("access_token", "")
+        _drive_access_token_expires_at = issued_at + int(
+            token_data.get("expires_in", 3600)
+        )
+        return _drive_access_token
+
+    except Exception as e:
+        log(f"Could not obtain Google Drive access token: {e}", "warning")
+        return ""
+
+
+def check_google_drive_folder_status(gdrive_link):
+    """Return missing/empty/nonempty/unknown for a linked client Drive folder."""
+    value = str(gdrive_link or "").strip()
+    if value.lower() in {"", "none", "null", "n/a", "na", "-"}:
+        return "missing"
+
+    folder_id = extract_drive_folder_id(value)
+    if not folder_id:
+        log(
+            f"Airtable Link is not a valid Google Drive folder link: {value}",
+            "warning"
+        )
+        return "missing"
+
+    params = {
+        "q": f"'{folder_id}' in parents and trashed = false",
+        "pageSize": 1,
+        "fields": "files(id,name,mimeType)",
+        "includeItemsFromAllDrives": "true",
+        "supportsAllDrives": "true",
+    }
+
+    try:
+        access_token = get_google_drive_access_token()
+        headers = {}
+
+        if access_token:
+            headers["Authorization"] = f"Bearer {access_token}"
+        elif GOOGLE_DRIVE_API_KEY:
+            params["key"] = GOOGLE_DRIVE_API_KEY
+        else:
+            log(
+                "Google Drive folder check skipped: no "
+                "GOOGLE_DRIVE_CREDENTIALS_FILE/GOOGLE_APPLICATION_CREDENTIALS "
+                "or GOOGLE_DRIVE_API_KEY configured",
+                "warning"
+            )
+            return "unknown"
+
+        response = requests.get(
+            GOOGLE_DRIVE_FILES_URL,
+            params=params,
+            headers=headers,
+            timeout=30,
+        )
+        response.raise_for_status()
+        files = response.json().get("files", [])
+
+        if files:
+            return "nonempty"
+        return "empty"
+
+    except Exception as e:
+        log(
+            f"Could not check Google Drive folder {folder_id}: {e}",
+            "warning"
+        )
+        return "unknown"
+
+
+def ensure_drive_status_label(card_id, gdrive_link):
+    """Maintain Trello labels for missing or empty client Drive folders."""
+    labels = trello_get(f"/cards/{card_id}/labels")
+
+    existing = {lbl.get("name"): lbl for lbl in labels}
+    no_link_label = existing.get(DRIVE_NO_LINK_LABEL)
+    empty_label = existing.get(DRIVE_FOLDER_EMPTY_LABEL)
+
+    status = check_google_drive_folder_status(gdrive_link)
+    log(f"Drive status for card {card_id}: {status}")
+
+    if status == "missing":
+        if empty_label:
+            trello_delete(
+                f"/cards/{card_id}/idLabels/{empty_label['id']}"
+            )
+        if not no_link_label:
+            trello_post(
+                f"/cards/{card_id}/labels",
+                {
+                    "name": DRIVE_NO_LINK_LABEL,
+                    "color": "red"
+                }
+            )
+        log(
+            f"⚠️ {DRIVE_NO_LINK_LABEL}: no client Drive link for card {card_id}. "
+            f"Temporary Drive root: {GOOGLE_DRIVE_ROOT_FOLDER_URL}",
+            "warning"
+        )
+        return
+
+    if status == "empty":
+        if no_link_label:
+            trello_delete(
+                f"/cards/{card_id}/idLabels/{no_link_label['id']}"
+            )
+        if not empty_label:
+            trello_post(
+                f"/cards/{card_id}/labels",
+                {
+                    "name": DRIVE_FOLDER_EMPTY_LABEL,
+                    "color": "yellow"
+                }
+            )
+        log(
+            f"⚠️ {DRIVE_FOLDER_EMPTY_LABEL}: linked client folder is empty "
+            f"for card {card_id}",
+            "warning"
+        )
+        return
+
+    if status == "nonempty":
+        if no_link_label:
+            trello_delete(
+                f"/cards/{card_id}/idLabels/{no_link_label['id']}"
+            )
+        if empty_label:
+            trello_delete(
+                f"/cards/{card_id}/idLabels/{empty_label['id']}"
+            )
+        log(f"✅ Client Drive folder contains content for card {card_id}")
+        return
+
+    # Unknown: leave existing status labels untouched so a temporary API
+    # outage does not erase a previously detected warning.
+    log(
+        f"Drive status could not be determined for card {card_id}; "
+        "existing Drive status labels were left unchanged",
+        "warning"
+    )
+
+
 def ensure_referral_label(card_id, referral_requested_date):
     labels = trello_get(f"/cards/{card_id}/labels")
 
@@ -1076,6 +1329,14 @@ for record in records:
 
             created += 1
 
+            # Drive status is checked ONLY once, when the Trello card is
+            # initially created from the Airtable record. Existing cards are
+            # deliberately not rechecked during normal sync updates.
+            ensure_drive_status_label(
+                card_id,
+                gdrive
+            )
+
             # =========================================================
             # ✅ DUPLICATE CHECK (MOVE THIS INTO YOUR MAIN LOOP)
             # =========================================================
@@ -1257,7 +1518,6 @@ for record in records:
             card_id,
             referral_requested_date
         )
-
 
         for key in fields.keys():
             if "SCC" in key:

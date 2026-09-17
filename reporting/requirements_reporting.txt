@@ -1,0 +1,5 @@
+requests>=2.31
+python-dateutil>=2.8
+matplotlib>=3.7
+reportlab>=4.0
+# artifact_tool is required only for XLSX output in this project environment.
