@@ -20,9 +20,10 @@
       font-size: 14px;
     }
 
-    #mark-read {
+    .mark-read {
       width: 100%;
       padding: 10px 14px;
+      margin-bottom: 8px;
       border: 0;
       border-radius: 3px;
       background: #0c66e4;
@@ -32,11 +33,11 @@
       font-weight: 600;
     }
 
-    #mark-read:hover {
+    .mark-read:hover {
       background: #0055cc;
     }
 
-    #mark-read:disabled {
+    .mark-read:disabled {
       opacity: 0.6;
       cursor: default;
     }
@@ -46,11 +47,15 @@
 <body>
 
   <div id="status">
-    Click <strong>Mark Read</strong> to remove the "New Message" label.
+    Choose which message type you want to mark as read.
   </div>
 
-  <button id="mark-read" type="button">
-    Mark Read
+  <button id="mark-whatsapp-read" class="mark-read" type="button">
+    Mark WhatsApp Read
+  </button>
+
+  <button id="mark-outlook-read" class="mark-read" type="button">
+    Mark Outlook Read
   </button>
 
   <script src="https://p.trellocdn.com/power-up.min.js"></script>
@@ -60,19 +65,19 @@
       "use strict";
 
       const POWERUP_APP_NAME =
-        "WhatsApp New Message - Mark Read";
+        "WhatsApp + Outlook New Message - Mark Read";
 
       const POWERUP_APP_KEY =
         "99fb195773ddc1e3bfbd79de31dd8647";
 
-      const NEW_MESSAGE_LABEL_NAME =
-        "New Message";
-
       const status =
         document.getElementById("status");
 
-      const button =
-        document.getElementById("mark-read");
+      const whatsappButton =
+        document.getElementById("mark-whatsapp-read");
+
+      const outlookButton =
+        document.getElementById("mark-outlook-read");
 
       /*
        * This is the secondary Power-Up iframe.
@@ -88,7 +93,7 @@
         status.textContent = message;
       }
 
-      function findNewMessageLabel(labels) {
+      function findLabel(labels, labelName) {
         if (!Array.isArray(labels)) {
           return null;
         }
@@ -99,15 +104,15 @@
               label &&
               typeof label.name === "string" &&
               label.name.trim().toLowerCase() ===
-                NEW_MESSAGE_LABEL_NAME.toLowerCase()
+                labelName.toLowerCase()
             );
           }) || null
         );
       }
 
-      async function run() {
+      async function run(labelName, button) {
         button.disabled = true;
-        setStatus("Checking the card...");
+        setStatus('Checking the card for "' + labelName + '"...');
 
         try {
           /*
@@ -126,11 +131,11 @@
           }
 
           const label =
-            findNewMessageLabel(card.labels);
+            findLabel(card.labels, labelName);
 
           if (!label || !label.id) {
             setStatus(
-              'The "New Message" label is already absent from this card.'
+              'The "' + labelName + '" label is already absent from this card.'
             );
 
             button.disabled = false;
@@ -203,7 +208,7 @@
            * DELETE /cards/{id}/idLabels/{idLabel}
            */
           setStatus(
-            'Removing "New Message"...'
+            'Removing "' + labelName + '"...'
           );
 
           const url =
@@ -262,7 +267,7 @@
 
         } catch (error) {
           console.error(
-            "[WhatsApp Mark Read] error:",
+            "[" + labelName + " Mark Read] error:",
             error
           );
 
@@ -280,9 +285,18 @@
         }
       }
 
-      button.addEventListener(
+      whatsappButton.addEventListener(
         "click",
-        run
+        function () {
+          run("WhatsApp", whatsappButton);
+        }
+      );
+
+      outlookButton.addEventListener(
+        "click",
+        function () {
+          run("Outlook", outlookButton);
+        }
       );
 
     })();

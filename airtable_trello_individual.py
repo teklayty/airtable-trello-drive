@@ -276,8 +276,7 @@ def add_comment(
         f"📌**SU AIRTABLE Record and Drive Docs**"
     ]
 
-    if coss_notes and str(coss_notes).strip():
-        lines.append(f"🟦 CoSS Notes:\n{notes_link}\n")
+    lines.append(f"🟦 CoSS Notes:\n{notes_link}\n")
 
     if scc_notes and str(scc_notes).strip():
         lines.append(f"🟨 SCC Notes:\n{notes_link}\n")
