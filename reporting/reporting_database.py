@@ -103,12 +103,94 @@ class ReportingDatabase:
 
                 CREATE INDEX IF NOT EXISTS idx_housing_date
                     ON housing_events(event_date);
+
+                CREATE TABLE IF NOT EXISTS client_links (
+                    source TEXT NOT NULL,
+                    source_record_id TEXT NOT NULL,
+                    airtable_id TEXT,
+                    match_method TEXT NOT NULL,
+                    confidence REAL NOT NULL DEFAULT 0,
+                    observed_at TEXT NOT NULL,
+                    PRIMARY KEY (source, source_record_id)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_client_links_airtable
+                    ON client_links(airtable_id, source);
+
+                CREATE TABLE IF NOT EXISTS trello_cards (
+                    card_id TEXT PRIMARY KEY,
+                    airtable_id TEXT,
+                    name TEXT NOT NULL,
+                    fullname TEXT,
+                    phone TEXT,
+                    whatsapp_phone TEXT,
+                    id_list TEXT,
+                    closed INTEGER NOT NULL DEFAULT 0,
+                    labels_json TEXT,
+                    short_link TEXT,
+                    url TEXT,
+                    date_last_activity TEXT,
+                    observed_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_trello_cards_client
+                    ON trello_cards(airtable_id);
+
+                CREATE TABLE IF NOT EXISTS trello_comments (
+                    action_id TEXT PRIMARY KEY,
+                    card_id TEXT NOT NULL,
+                    airtable_id TEXT,
+                    comment_date TEXT,
+                    text TEXT NOT NULL,
+                    source_classification TEXT NOT NULL DEFAULT 'trello',
+                    outlook_message_id TEXT,
+                    observed_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_trello_comments_date
+                    ON trello_comments(comment_date);
+
+                CREATE INDEX IF NOT EXISTS idx_trello_comments_client
+                    ON trello_comments(airtable_id, comment_date);
+
+                CREATE TABLE IF NOT EXISTS communication_events (
+                    event_key TEXT PRIMARY KEY,
+                    source TEXT NOT NULL,
+                    source_record_id TEXT NOT NULL,
+                    airtable_id TEXT,
+                    card_id TEXT,
+                    direction TEXT,
+                    event_at TEXT,
+                    sender TEXT,
+                    recipients TEXT,
+                    subject TEXT,
+                    body_preview TEXT,
+                    has_attachments INTEGER NOT NULL DEFAULT 0,
+                    attachment_count INTEGER NOT NULL DEFAULT 0,
+                    metadata_json TEXT NOT NULL DEFAULT '{}'
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_communication_date
+                    ON communication_events(event_at, source);
+
+                CREATE INDEX IF NOT EXISTS idx_communication_client
+                    ON communication_events(airtable_id, event_at);
+
+                CREATE TABLE IF NOT EXISTS source_sync_runs (
+                    sync_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    source TEXT NOT NULL,
+                    started_at TEXT NOT NULL,
+                    finished_at TEXT,
+                    records_seen INTEGER NOT NULL DEFAULT 0,
+                    records_stored INTEGER NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL,
+                    error TEXT
+                );
                 """
             )
 
     @staticmethod
     def _safe_datetime(value: datetime) -> datetime:
-        """Normalise a datetime before serialising it to ISO text."""
         if value.tzinfo is None:
             return value.replace(tzinfo=timezone.utc)
         try:
@@ -309,3 +391,256 @@ class ReportingDatabase:
                 "SELECT * FROM housing_events WHERE event_date >= ? AND event_date < ? ORDER BY event_date",
                 (self._dt(start), self._dt(end)),
             ).fetchall()
+
+    def upsert_client_link(
+        self,
+        source: str,
+        source_record_id: str,
+        airtable_id: str | None,
+        match_method: str,
+        confidence: float,
+        observed_at: datetime | None = None,
+    ) -> None:
+        observed_at = observed_at or datetime.now().astimezone()
+        with self.connect() as con:
+            con.execute(
+                """
+                INSERT INTO client_links
+                (source, source_record_id, airtable_id, match_method, confidence, observed_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(source, source_record_id) DO UPDATE SET
+                    airtable_id=excluded.airtable_id,
+                    match_method=excluded.match_method,
+                    confidence=excluded.confidence,
+                    observed_at=excluded.observed_at
+                """,
+                (
+                    source,
+                    source_record_id,
+                    airtable_id,
+                    match_method,
+                    float(confidence),
+                    self._dt(observed_at),
+                ),
+            )
+            con.commit()
+
+    def upsert_trello_card(self, card: dict, observed_at: datetime | None = None) -> None:
+        observed_at = observed_at or datetime.now().astimezone()
+        with self.connect() as con:
+            con.execute(
+                """
+                INSERT INTO trello_cards (
+                    card_id, airtable_id, name, fullname, phone, whatsapp_phone,
+                    id_list, closed, labels_json, short_link, url,
+                    date_last_activity, observed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(card_id) DO UPDATE SET
+                    airtable_id=excluded.airtable_id,
+                    name=excluded.name,
+                    fullname=excluded.fullname,
+                    phone=excluded.phone,
+                    whatsapp_phone=excluded.whatsapp_phone,
+                    id_list=excluded.id_list,
+                    closed=excluded.closed,
+                    labels_json=excluded.labels_json,
+                    short_link=excluded.short_link,
+                    url=excluded.url,
+                    date_last_activity=excluded.date_last_activity,
+                    observed_at=excluded.observed_at
+                """,
+                (
+                    card["card_id"],
+                    card.get("airtable_id"),
+                    card.get("name", ""),
+                    card.get("fullname", ""),
+                    card.get("phone", ""),
+                    card.get("whatsapp_phone", ""),
+                    card.get("id_list", ""),
+                    int(bool(card.get("closed"))),
+                    json.dumps(card.get("labels_json", []), ensure_ascii=False, default=str),
+                    card.get("short_link", ""),
+                    card.get("url", ""),
+                    self._dt(card.get("date_last_activity")),
+                    self._dt(observed_at),
+                ),
+            )
+            con.commit()
+
+    def upsert_trello_comment(
+        self,
+        action_id: str,
+        card_id: str,
+        airtable_id: str | None,
+        comment_date: datetime | None,
+        text: str,
+        source_classification: str = "trello",
+        outlook_message_id: str | None = None,
+        observed_at: datetime | None = None,
+    ) -> None:
+        observed_at = observed_at or datetime.now().astimezone()
+        with self.connect() as con:
+            con.execute(
+                """
+                INSERT INTO trello_comments (
+                    action_id, card_id, airtable_id, comment_date, text,
+                    source_classification, outlook_message_id, observed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(action_id) DO UPDATE SET
+                    card_id=excluded.card_id,
+                    airtable_id=excluded.airtable_id,
+                    comment_date=excluded.comment_date,
+                    text=excluded.text,
+                    source_classification=excluded.source_classification,
+                    outlook_message_id=excluded.outlook_message_id,
+                    observed_at=excluded.observed_at
+                """,
+                (
+                    action_id,
+                    card_id,
+                    airtable_id,
+                    self._dt(comment_date),
+                    text,
+                    source_classification,
+                    outlook_message_id,
+                    self._dt(observed_at),
+                ),
+            )
+            con.commit()
+
+    def upsert_communication_event(self, event: dict) -> None:
+        event_key = self._key(
+            event.get("source"),
+            event.get("source_record_id"),
+        )
+        with self.connect() as con:
+            con.execute(
+                """
+                INSERT INTO communication_events (
+                    event_key, source, source_record_id, airtable_id, card_id,
+                    direction, event_at, sender, recipients, subject, body_preview,
+                    has_attachments, attachment_count, metadata_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(event_key) DO UPDATE SET
+                    source=excluded.source,
+                    source_record_id=excluded.source_record_id,
+                    airtable_id=excluded.airtable_id,
+                    card_id=excluded.card_id,
+                    direction=excluded.direction,
+                    event_at=excluded.event_at,
+                    sender=excluded.sender,
+                    recipients=excluded.recipients,
+                    subject=excluded.subject,
+                    body_preview=excluded.body_preview,
+                    has_attachments=excluded.has_attachments,
+                    attachment_count=excluded.attachment_count,
+                    metadata_json=excluded.metadata_json
+                """,
+                (
+                    event_key,
+                    event.get("source", "unknown"),
+                    event.get("source_record_id", ""),
+                    event.get("airtable_id"),
+                    event.get("card_id"),
+                    event.get("direction"),
+                    self._dt(event.get("event_at")),
+                    event.get("sender", ""),
+                    event.get("recipients", ""),
+                    event.get("subject", ""),
+                    event.get("body_preview", ""),
+                    int(bool(event.get("has_attachments"))),
+                    int(event.get("attachment_count") or 0),
+                    json.dumps(event.get("metadata", {}), ensure_ascii=False, default=str),
+                ),
+            )
+            con.commit()
+
+    def begin_sync(self, source: str) -> int:
+        started = datetime.now().astimezone()
+        with self.connect() as con:
+            cur = con.execute(
+                "INSERT INTO source_sync_runs (source, started_at, status) VALUES (?, ?, 'running')",
+                (source, self._dt(started)),
+            )
+            sync_id = int(cur.lastrowid)
+            con.commit()
+        return sync_id
+
+    def finish_sync(
+        self,
+        sync_id: int,
+        records_seen: int,
+        records_stored: int,
+        status: str = "ok",
+        error: str | None = None,
+    ) -> None:
+        with self.connect() as con:
+            con.execute(
+                """
+                UPDATE source_sync_runs
+                SET finished_at=?, records_seen=?, records_stored=?, status=?, error=?
+                WHERE sync_id=?
+                """,
+                (
+                    self._dt(datetime.now().astimezone()),
+                    int(records_seen),
+                    int(records_stored),
+                    status,
+                    error,
+                    sync_id,
+                ),
+            )
+            con.commit()
+
+    def communication_events(
+        self,
+        start: datetime,
+        end: datetime,
+        source: str | None = None,
+    ) -> list[sqlite3.Row]:
+        query = "SELECT * FROM communication_events WHERE event_at >= ? AND event_at < ?"
+        params: list[object] = [self._dt(start), self._dt(end)]
+        if source:
+            query += " AND source = ?"
+            params.append(source)
+        query += " ORDER BY event_at"
+        with self.connect() as con:
+            return con.execute(query, params).fetchall()
+
+    def trello_cards_summary(self) -> dict[str, int]:
+        with self.connect() as con:
+            total = int(con.execute("SELECT COUNT(*) FROM trello_cards").fetchone()[0])
+            active = int(con.execute("SELECT COUNT(*) FROM trello_cards WHERE closed=0").fetchone()[0])
+            linked = int(
+                con.execute(
+                    "SELECT COUNT(*) FROM trello_cards WHERE airtable_id IS NOT NULL AND TRIM(airtable_id) <> ''"
+                ).fetchone()[0]
+            )
+            return {
+                "total": total,
+                "active": active,
+                "linked": linked,
+                "unlinked": total - linked,
+            }
+
+    def trello_comment_count(self, start: datetime, end: datetime) -> int:
+        with self.connect() as con:
+            return int(
+                con.execute(
+                    "SELECT COUNT(*) FROM trello_comments WHERE comment_date >= ? AND comment_date < ?",
+                    (self._dt(start), self._dt(end)),
+                ).fetchone()[0]
+            )
+
+    def trello_comment_classifications(self, start: datetime, end: datetime) -> dict[str, int]:
+        with self.connect() as con:
+            rows = con.execute(
+                """
+                SELECT source_classification, COUNT(*)
+                FROM trello_comments
+                WHERE comment_date >= ? AND comment_date < ?
+                GROUP BY source_classification
+                """,
+                (self._dt(start), self._dt(end)),
+            ).fetchall()
+        return {row[0]: int(row[1]) for row in rows}

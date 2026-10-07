@@ -11,6 +11,7 @@ from .excel_report import build_xlsx
 from .metrics import build_metrics
 from .pdf_report import build_pdf
 from .reporting_database import ReportingDatabase
+from .source_sync import sync_external_sources
 
 
 def _safe_sheet_value(value):
@@ -40,7 +41,15 @@ def export_csv(metrics: dict, path: Path) -> Path:
         ["KPI", "Referrals", metrics["referrals"]],
         ["KPI", "Support / engagement events", metrics["support_events"]],
         ["KPI", "Housing changes", metrics["housing_changes"]],
-        ["KPI", "WhatsApp messages", metrics["whatsapp"]["total"]],
+        ["KPI", "WhatsApp messages", metrics["communications"]["whatsapp_total"]],
+        ["KPI", "Incoming Outlook emails", metrics["communications"]["outlook_incoming"]],
+        ["KPI", "Outgoing Outlook emails", metrics["communications"]["outlook_outgoing"]],
+        ["KPI", "Total communications", metrics["communications"]["total"]],
+        ["KPI", "WhatsApp incoming", metrics["communications"]["whatsapp_incoming"]],
+        ["KPI", "WhatsApp outgoing", metrics["communications"]["whatsapp_outgoing"]],
+        ["KPI", "Incoming Outlook emails", metrics["communications"]["outlook_incoming"]],
+        ["KPI", "Outgoing Outlook emails", metrics["communications"]["outlook_outgoing"]],
+        ["KPI", "Trello comments", metrics["trello"]["comments"]],
     ])
 
     with path.open("w", newline="", encoding="utf-8") as fh:
@@ -65,6 +74,7 @@ def run_report(
     clients = load_clients()
     db = ReportingDatabase()
     db.record_clients(clients)
+    sync_external_sources(db, clients)
     metrics = build_metrics(db, start, end, clients, period_label)
 
     stamp = {

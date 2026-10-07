@@ -5,7 +5,6 @@ from datetime import datetime, timedelta
 from typing import Iterable
 
 from .reporting_database import ReportingDatabase
-from .whatsapp_source import summarize_whatsapp
 
 
 def _clean_label(value: str, default: str = "Unknown") -> str:
@@ -120,7 +119,33 @@ def build_metrics(
     current_providers = provider_counts(latest)
     current_referral_outcomes = outcome_counts(latest, "referral_outcome")
     current_overall_outcomes = outcome_counts(latest, "overall_outcome")
-    whatsapp = summarize_whatsapp(start, end)
+    communication_rows = db.communication_events(start, end)
+    whatsapp_rows = [r for r in communication_rows if r["source"] == "whatsapp"]
+    outlook_rows = [r for r in communication_rows if r["source"] == "outlook"]
+    whatsapp_message_rows = [r for r in whatsapp_rows if r["source"] == "whatsapp" and r["direction"] in {"incoming", "outgoing"}]
+    whatsapp_attachment_rows = [r for r in communication_rows if r["source"] == "whatsapp_attachment"]
+
+    whatsapp_incoming = sum(1 for r in whatsapp_message_rows if r["direction"] == "incoming")
+    whatsapp_outgoing = sum(1 for r in whatsapp_message_rows if r["direction"] == "outgoing")
+    outlook_incoming = sum(1 for r in outlook_rows if r["direction"] == "incoming")
+    outlook_outgoing = sum(1 for r in outlook_rows if r["direction"] == "outgoing")
+    communication_client_ids = {
+        r["airtable_id"] for r in communication_rows if r["airtable_id"]
+    }
+    communications = {
+        "whatsapp_incoming": whatsapp_incoming,
+        "whatsapp_outgoing": whatsapp_outgoing,
+        "whatsapp_total": whatsapp_incoming + whatsapp_outgoing,
+        "whatsapp_attachments": len(whatsapp_attachment_rows),
+        "outlook_incoming": outlook_incoming,
+        "outlook_outgoing": outlook_outgoing,
+        "outlook_total": outlook_incoming + outlook_outgoing,
+        "total": whatsapp_incoming + whatsapp_outgoing + outlook_incoming + outlook_outgoing,
+        "unique_clients": len(communication_client_ids),
+    }
+    trello_cards = db.trello_cards_summary()
+    trello_comments = db.trello_comment_count(start, end)
+    trello_comment_types = db.trello_comment_classifications(start, end)
 
     latest_payloads = []
     import json
@@ -143,6 +168,9 @@ def build_metrics(
         "Housing outcome recorded": housing_outcome_present,
         "Referral outcome recorded": referral_outcome_present,
         "Overall case outcome recorded": overall_outcome_present,
+        "Trello cards linked to Airtable": trello_cards["linked"],
+        "Trello cards without Airtable match": trello_cards["unlinked"],
+        "Communications linked to Airtable client": len(communication_client_ids),
     }
 
     return {
@@ -166,7 +194,19 @@ def build_metrics(
         "current_referral_outcomes": current_referral_outcomes,
         "current_overall_outcomes": current_overall_outcomes,
         "eviction_risk": eviction_risk_counts(latest, datetime.now().astimezone()),
-        "whatsapp": whatsapp,
+        "whatsapp": {
+            "available": bool(whatsapp_rows or whatsapp_message_rows or whatsapp_attachment_rows),
+            "incoming": whatsapp_incoming,
+            "outgoing": whatsapp_outgoing,
+            "total": whatsapp_incoming + whatsapp_outgoing,
+            "attachments": len(whatsapp_attachment_rows),
+        },
+        "communications": communications,
+        "trello": {
+            **trello_cards,
+            "comments": trello_comments,
+            "comments_by_source": trello_comment_types,
+        },
         "data_quality": data_quality,
         "latest_clients": latest,
         "referral_events": referral_events,

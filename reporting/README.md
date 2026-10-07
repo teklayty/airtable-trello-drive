@@ -11,7 +11,16 @@ Standalone reporting layer for the Airtable → Trello and WhatsApp services.
 - CSV summary for audit/data use
 - Optional XLSX workbook using `artifact_tool`
 - SQLite historical snapshot/event database
-- Aggregate WhatsApp activity pulled from `whatsapp_service.db`
+- Historical WhatsApp message/attachment events pulled from `whatsapp_service.db`
+- Trello card/comment activity collected through the existing Trello API credentials
+- Option A Outlook reporting: Power Automate Outlook comments already written to Trello are classified and counted as Outlook events
+- Unified communication metrics across WhatsApp and Outlook without double-counting Trello workflow comments
+
+## Four-source reporting model
+
+Airtable remains the canonical client/case source. WhatsApp events come directly from the existing `whatsapp_service.db`. Trello cards and comments are collected through the same Trello API credentials used by the operational WhatsApp → Trello service. Outlook uses **Option A**: the reporting collector recognises the `📧⬇️ **Incoming Outlook**` and `📧⬆️ **Outgoing Outlook**` comments written to Trello by Power Automate, so no second Outlook authentication system is introduced.
+
+The reporting database keeps source-specific records plus a conservative Airtable client link. Exact phone matches are preferred, followed by exact full-name matches; ambiguous matches remain unlinked instead of being guessed.
 
 ## Why there is a database
 
@@ -38,6 +47,20 @@ The collector uses the real field names already identified in the SPRING Airtabl
 - referral-date fields for CoSS, CAS, New Beginnings, SAVTE, SCC, SOLACE and Ukraine Therapeutic Project.
 
 Housing provider/outcome/referral-outcome/overall-outcome fields are configurable because the supplied Airtable field list did not establish a single unambiguous provider/outcome field. Do not infer provider identity from unrelated fields.
+
+## External-source configuration
+
+The reporting layer reuses the existing Trello API credentials and board ID, but its optional list scope is independent of the operational WhatsApp sync:
+
+```text
+TRELLO_API_KEY=...
+TRELLO_API_TOKEN=...
+TRELLO_BOARD_ID=651c07f8f94359a91f17bec5
+REPORT_TRELLO_LIST_IDS=...    # optional; empty means scan the board
+REPORT_SYNC_EXTERNAL_SOURCES=true
+```
+
+Power Automate does not require any new credential in this Option A design. It only needs to keep writing the standard Outlook comments to the matching Trello cards.
 
 ## Run locally
 

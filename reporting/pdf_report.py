@@ -34,13 +34,16 @@ def _card_table(metrics: dict):
         ("Referrals", metrics["referrals"]),
         ("Support / engagement events", metrics["support_events"]),
         ("Housing changes", metrics["housing_changes"]),
-        ("WhatsApp messages", metrics["whatsapp"]["total"]),
+        ("Total communications", metrics["communications"]["total"]),
+        ("Trello comments", metrics["trello"]["comments"]),
     ]
-    data = [cards[:3], cards[3:]]
+    data = [cards[i:i + 3] for i in range(0, len(cards), 3)]
+    # Pad the last row so the PDF table always has three columns.
+    data = [row + [("", "")] * (3 - len(row)) for row in data]
     table = Table(
         [[Paragraph(f"<b>{label}</b><br/><font size='20'>{value}</font>", ParagraphStyle("card", alignment=TA_CENTER, leading=24)) for label, value in row] for row in data],
         colWidths=[58 * mm] * 3,
-        rowHeights=[30 * mm] * 2,
+        rowHeights=[30 * mm] * len(data),
         hAlign="CENTER",
     )
     table.setStyle(TableStyle([
@@ -141,13 +144,30 @@ def build_pdf(metrics: dict, output_path: Path, report_kind: str) -> Path:
     story.extend(_counter_table(metrics["eviction_risk"], "Current eviction-date risk"))
     story.append(_flowable_image(donut_chart(dict(metrics["eviction_risk"]), "Eviction risk picture"), 150 * mm, 120 * mm))
 
-    story.append(Paragraph("WhatsApp activity", h2))
-    wa = metrics["whatsapp"]
+    story.append(PageBreak())
+    story.append(Paragraph("Cross-system communications", h2))
+    comms = metrics["communications"]
     story.extend(_counter_table({
-        "Incoming": wa["incoming"],
-        "Outgoing": wa["outgoing"],
-        "Attachments": wa["attachments"],
-    }, "WhatsApp activity"))
+        "WhatsApp incoming": comms["whatsapp_incoming"],
+        "WhatsApp outgoing": comms["whatsapp_outgoing"],
+        "WhatsApp attachments": comms["whatsapp_attachments"],
+        "Outlook incoming": comms["outlook_incoming"],
+        "Outlook outgoing": comms["outlook_outgoing"],
+        "Total communications": comms["total"],
+        "Clients with communication": comms["unique_clients"],
+    }, "Communication activity"))
+
+    story.append(Paragraph("Trello activity", h2))
+    trello = metrics["trello"]
+    story.extend(_counter_table({
+        "Active cards": trello["active"],
+        "All cards collected": trello["total"],
+        "Cards linked to Airtable": trello["linked"],
+        "Cards without Airtable match": trello["unlinked"],
+        "Comments in reporting period": trello["comments"],
+    }, "Trello activity"))
+    if trello.get("comments_by_source"):
+        story.extend(_counter_table(trello["comments_by_source"], "Trello comments by source"))
 
     story.append(Paragraph("Data quality", h2))
     quality_rows = [["Measure", "Count", "Coverage"]]
@@ -169,6 +189,10 @@ def build_pdf(metrics: dict, output_path: Path, report_kind: str) -> Path:
     story.append(quality_table)
     story.append(Spacer(1, 5 * mm))
     story.append(Paragraph(
+        "Outlook activity is collected from the Outlook comments that Power Automate writes to Trello in Option A; "
+        "those comments are counted as Outlook communication rather than as an independent Outlook API feed. "
+        "WhatsApp activity is read from the WhatsApp service database. Trello comments are also reported separately "
+        "as workflow activity, so communication counts are not derived from Trello comment totals. "
         "Historical trend reporting depends on regular snapshots. Run this reporting collector daily to preserve "
         "change history. Housing-provider, referral-outcome and overall-case-outcome metrics remain blank/unknown "
         "until their fields are populated in Airtable.",

@@ -51,6 +51,17 @@ REPORT_INCLUDE_PII = os.getenv("REPORT_INCLUDE_PII", "false").strip().lower() in
 REPORT_TITLE = os.getenv("REPORT_TITLE", "SPRING Service Reporting")
 REPORT_ORGANISATION = os.getenv("REPORT_ORGANISATION", "SPRING")
 
+# Existing Trello credentials are already used by the WhatsApp → Trello service.
+# The reporting layer reuses those environment variables and does not introduce
+# a second authentication mechanism.
+TRELLO_API_KEY = os.getenv("TRELLO_API_KEY", "")
+TRELLO_API_TOKEN = os.getenv("TRELLO_API_TOKEN", os.getenv("TRELLO_TOKEN", ""))
+TRELLO_BOARD_ID = os.getenv("TRELLO_BOARD_ID", "651c07f8f94359a91f17bec5")
+REPORT_TRELLO_LIST_IDS = os.getenv("REPORT_TRELLO_LIST_IDS", "")
+REPORT_SYNC_EXTERNAL_SOURCES = os.getenv("REPORT_SYNC_EXTERNAL_SOURCES", "true").strip().lower() in {
+    "1", "true", "yes", "y", "on"
+}
+
 
 def require_airtable_config() -> None:
     missing = []

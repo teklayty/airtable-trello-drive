@@ -3648,65 +3648,6 @@ def legacy_message_content_exists(
     return False
 
 
-# ============================================================
-# WHATSAPP HELPERS
-# ============================================================
-
-
-# def get_conversation_header(page):
-#     selectors = [
-#         '[data-testid="conversation-panel-header"]',
-#         '[data-testid="conversation-header"]',
-#         "#main header",
-#     ]
-
-#     for selector in selectors:
-#         try:
-#             locator = page.locator(selector)
-#             count = locator.count()
-
-#             logger.info(
-#                 "[WHATSAPP HEADER DEBUG] selector=%r count=%d", selector, count
-#             )
-
-#             for i in range(count):
-#                 candidate = locator.nth(i)
-
-#                 try:
-#                     if not candidate.is_visible():
-#                         continue
-
-#                     text = candidate.inner_text(timeout=2000).strip()
-
-#                     logger.info(
-#                         "[WHATSAPP HEADER DEBUG] selector=%r index=%d text=%r",
-#                         selector,
-#                         i,
-#                         text,
-#                     )
-
-#                     if text:
-#                         return candidate
-
-#                 except Exception as e:
-#                     logger.debug(
-#                         "[WHATSAPP HEADER DEBUG] selector=%r index=%d failed:"
-#                         " %s",
-#                         selector,
-#                         i,
-#                         e,
-#                     )
-
-#         except Exception as e:
-#             logger.debug(
-#                 "[WHATSAPP HEADER DEBUG] selector=%r failed: %s", selector, e
-#             )
-
-#     logger.warning(
-#         "[WHATSAPP HEADER DEBUG] Could not find a visible conversation header."
-#     )
-
-#     return None
 
 def get_conversation_header(page):
     """
@@ -9724,7 +9665,90 @@ def get_new_messages(
                 continue
 
             text = extract_message_text(message_element)
-            has_attachment = message_has_attachment(message_element)
+
+            # ------------------------------------------------------------
+            # ATTACHMENT PROBE
+            # ------------------------------------------------------------
+            has_attachment = False
+
+            try:
+                has_attachment = message_has_attachment(message_element)
+
+                logger.info(
+                    "[%s] ATTACHMENT PROBE: idx=%d initial_detected=%s text=%r",
+                    whatsapp_account,
+                    i,
+                    has_attachment,
+                    text,
+                )
+
+                # Some WhatsApp attachment controls/media nodes only become available
+                # after the message bubble is hovered.
+                if not has_attachment:
+                    try:
+                        message_element.hover(timeout=1000)
+                        page.wait_for_timeout(150)
+                    except Exception as hover_err:
+                        logger.debug(
+                            "[%s] ATTACHMENT PROBE: hover failed idx=%d: %s",
+                            whatsapp_account,
+                            i,
+                            hover_err,
+                        )
+
+                    has_attachment = message_has_attachment(message_element)
+
+                    logger.info(
+                        "[%s] ATTACHMENT PROBE: idx=%d after_hover=%s text=%r",
+                        whatsapp_account,
+                        i,
+                        has_attachment,
+                        text,
+                    )
+
+                    if has_attachment:
+                        try:
+                            attachment_dom = message_element.evaluate("""el => ({
+                                html: el.outerHTML.slice(0, 12000),
+                                images: el.querySelectorAll('img').length,
+                                videos: el.querySelectorAll('video').length,
+                                canvases: el.querySelectorAll('canvas').length,
+                                audios: el.querySelectorAll('audio').length,
+                                downloads: el.querySelectorAll(
+                                    '[data-testid*="download"], [aria-label*="Download" i], [title*="Download" i]'
+                                ).length,
+                                documents: el.querySelectorAll(
+                                    '[data-testid*="document"], [data-icon*="document"]'
+                                ).length,
+                                mediaNodes: el.querySelectorAll(
+                                    '[data-testid*="media"], [data-testid*="attachment"], [data-testid*="file"]'
+                                ).length
+                            })""")
+
+                            logger.info(
+                                "[%s] ATTACHMENT DOM: idx=%d %r",
+                                whatsapp_account,
+                                i,
+                                attachment_dom,
+                            )
+
+                        except Exception as e:
+                            logger.debug(
+                                "[%s] ATTACHMENT DOM inspection failed idx=%d: %s",
+                                whatsapp_account,
+                                i,
+                                e,
+                            )
+
+            except Exception as attachment_probe_err:
+                logger.warning(
+                    "[%s] ATTACHMENT PROBE: failed idx=%d: %s",
+                    whatsapp_account,
+                    i,
+                    attachment_probe_err,
+                )
+                has_attachment = False
+
             timestamp = get_message_timestamp(message_element)
             # A media-only message can legitimately be represented by a second
             # wrapper whose visible text is only the timestamp (e.g. `13:34`).

@@ -18,22 +18,25 @@ def build_xlsx(metrics: dict, output_path: Path) -> Path:
     referrals = wb.worksheets.add("Referrals")
     housing = wb.worksheets.add("Housing")
     whatsapp = wb.worksheets.add("WhatsApp")
+    communications = wb.worksheets.add("Communications")
+    trello = wb.worksheets.add("Trello")
 
     dashboard.get_range("A1:B1").values = [["SPRING Reporting", metrics["period_label"]]]
-    dashboard.get_range("A3:B8").values = [
+    dashboard.get_range("A3:B9").values = [
         ["People supported", metrics["people_supported"]],
         ["New clients", metrics["new_clients"]],
         ["Referrals", metrics["referrals"]],
         ["Support / engagement events", metrics["support_events"]],
         ["Housing changes", metrics["housing_changes"]],
-        ["WhatsApp messages", metrics["whatsapp"]["total"]],
+        ["Total communications", metrics["communications"]["total"]],
+        ["Trello comments", metrics["trello"]["comments"]],
     ]
     dashboard.get_range("A1:B1").format = {
         "fill": "#1F2937",
         "font": {"bold": True, "color": "#FFFFFF", "size": 14},
         "horizontal_alignment": "center",
     }
-    dashboard.get_range("A3:B8").format.borders = {
+    dashboard.get_range("A3:B9").format.borders = {
         "items": [
             {"color": "#D0D5DD", "style": "continuous", "weight": "thin"}
         ]
@@ -55,9 +58,24 @@ def build_xlsx(metrics: dict, output_path: Path) -> Path:
     write_counter(referrals, metrics["referrals_by_org"])
     write_counter(housing, metrics["current_housing"])
     write_counter(whatsapp, {
-        "Incoming": metrics["whatsapp"]["incoming"],
-        "Outgoing": metrics["whatsapp"]["outgoing"],
-        "Attachments": metrics["whatsapp"]["attachments"],
+        "Incoming": metrics["communications"]["whatsapp_incoming"],
+        "Outgoing": metrics["communications"]["whatsapp_outgoing"],
+        "Attachments": metrics["communications"]["whatsapp_attachments"],
+    })
+    write_counter(communications, {
+        "WhatsApp incoming": metrics["communications"]["whatsapp_incoming"],
+        "WhatsApp outgoing": metrics["communications"]["whatsapp_outgoing"],
+        "Outlook incoming": metrics["communications"]["outlook_incoming"],
+        "Outlook outgoing": metrics["communications"]["outlook_outgoing"],
+        "Total communications": metrics["communications"]["total"],
+        "Clients with communication": metrics["communications"]["unique_clients"],
+    })
+    write_counter(trello, {
+        "All cards": metrics["trello"]["total"],
+        "Active cards": metrics["trello"]["active"],
+        "Linked to Airtable": metrics["trello"]["linked"],
+        "Without Airtable match": metrics["trello"]["unlinked"],
+        "Comments in period": metrics["trello"]["comments"],
     })
 
     dashboard.get_range("D3:E9").values = [
