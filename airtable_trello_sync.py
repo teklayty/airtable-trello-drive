@@ -17,6 +17,10 @@ import time
 TRELLO_API_KEY = os.getenv("TRELLO_API_KEY")
 TRELLO_API_TOKEN = os.getenv("TRELLO_API_TOKEN")
 
+# Trello custom field used to store Airtable Date of Birth.
+# display_cardFront=False keeps the DOB off the card front.
+TRELLO_DOB_CUSTOM_FIELD_NAME = os.getenv("TRELLO_DOB_CUSTOM_FIELD_NAME", "Date of Birth")
+
 CREATE_LIST_ID = os.getenv("TRELLO_CREATE_LIST_ID")
 EXISTING_LIST_IDS = os.getenv("TRELLO_EXISTING_LIST_IDS")
 RAW_ALLOWED_STAFF = os.getenv("TRELLO_ALLOWED_STAFF", "")
@@ -607,6 +611,136 @@ def trello_delete(path):
     r = requests.delete(f"{BASE_URL}{path}", params=AUTH)
     r.raise_for_status()
 
+
+def trello_post_json(path, data):
+    """POST a JSON payload to Trello."""
+    r = requests.post(
+        f"{BASE_URL}{path}",
+        params=AUTH,
+        json=data,
+        headers={"Accept": "application/json", "Content-Type": "application/json"},
+    )
+    r.raise_for_status()
+    return r.json() if r.text else {}
+
+
+def trello_put_json(path, data):
+    """PUT a JSON payload to Trello."""
+    r = requests.put(
+        f"{BASE_URL}{path}",
+        params=AUTH,
+        json=data,
+        headers={"Accept": "application/json", "Content-Type": "application/json"},
+    )
+    r.raise_for_status()
+    return r.json() if r.text else {}
+
+# =========================================================
+# TRELLO DATE OF BIRTH CUSTOM FIELD
+# =========================================================
+
+def normalize_airtable_dob(value):
+    """Convert an Airtable DOB value into Trello's ISO date value."""
+    raw = str(value or "").strip()
+    if raw.lower() in {"", "none", "null", "n/a", "na", "-", "[]"}:
+        return None
+
+    for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%Y/%m/%d", "%d-%m-%Y"):
+        try:
+            dt = datetime.strptime(raw, fmt)
+            return dt.strftime("%Y-%m-%dT00:00:00.000Z")
+        except ValueError:
+            pass
+
+    try:
+        dt = parse_iso(raw, dayfirst=True)
+        return dt.strftime("%Y-%m-%dT00:00:00.000Z")
+    except Exception:
+        log(f"Could not parse Airtable Date of Birth value {raw!r}", "warning")
+        return None
+
+
+def get_or_create_dob_custom_field(board_id):
+    """Find the board Date of Birth field or create it as a hidden date field."""
+    if not board_id:
+        raise ValueError("Cannot create/find DOB custom field without a Trello board ID.")
+
+    wanted = TRELLO_DOB_CUSTOM_FIELD_NAME.strip().lower()
+    fields = trello_get(f"/boards/{board_id}/customFields") or []
+
+    for field in fields:
+        name = str(field.get("name") or "").strip()
+        if name.lower() != wanted:
+            continue
+
+        field_id = field.get("id")
+        field_type = str(field.get("type") or "").lower()
+        if not field_id:
+            continue
+        if field_type != "date":
+            raise RuntimeError(
+                f"Trello custom field {name!r} already exists but is type {field_type!r}, not date."
+            )
+
+        # Keep DOB off the card front.
+        display = field.get("display") or {}
+        if display.get("cardFront") is not False:
+            try:
+                trello_put_json(
+                    f"/customFields/{field_id}",
+                    {"display/cardFront": False},
+                )
+                log(f"Set Trello DOB custom field {field_id} to hidden on card front")
+            except Exception as exc:
+                log(
+                    f"Could not hide Trello DOB custom field {field_id}: {exc}",
+                    "warning",
+                )
+        return field_id
+
+    created = trello_post_json(
+        "/customFields",
+        {
+            "idModel": board_id,
+            "modelType": "board",
+            "name": TRELLO_DOB_CUSTOM_FIELD_NAME,
+            "type": "date",
+            "pos": "top",
+            "display_cardFront": False,
+        },
+    )
+
+    field_id = created.get("id")
+    if not field_id:
+        raise RuntimeError("Trello created the DOB custom field without returning an ID.")
+
+    log(
+        f"Created Trello Date of Birth custom field: name={TRELLO_DOB_CUSTOM_FIELD_NAME!r} "
+        f"id={field_id} display_cardFront=False"
+    )
+    return field_id
+
+
+def set_card_date_of_birth(card_id, custom_field_id, airtable_dob):
+    """Write or clear the Airtable Date of Birth on a Trello card."""
+    if not card_id or not custom_field_id:
+        return False
+
+    dob_iso = normalize_airtable_dob(airtable_dob)
+    payload = {"value": {"date": dob_iso}} if dob_iso else {"idValue": "", "value": ""}
+
+    trello_put_json(
+        f"/cards/{card_id}/customField/{custom_field_id}/item",
+        payload,
+    )
+
+    if dob_iso:
+        log(f"Updated Trello Date of Birth: card={card_id} dob={dob_iso[:10]}")
+    else:
+        log(f"Cleared Trello Date of Birth: card={card_id}")
+
+    return True
+
 # =========================================================
 # COMMENTS
 # =========================================================
@@ -1169,6 +1303,13 @@ existing_cards, phone_index = load_existing_cards()
 
 # Find urgent list ID
 board_id = trello_get(f"/lists/{CREATE_LIST_ID}")["idBoard"]
+
+try:
+    dob_custom_field_id = get_or_create_dob_custom_field(board_id)
+except Exception as exc:
+    dob_custom_field_id = None
+    log(f"Could not initialise Trello Date of Birth custom field: {exc}", "error")
+
 urgent_list_id = None
 for lst in trello_get(f"/boards/{board_id}/lists"):
     if lst["name"] == URGENT_LIST_NAME:
@@ -1209,6 +1350,7 @@ for record in records:
         first = get_field(fields, "Forename/First name(s)")
         last = get_field(fields, "Surname/Last Name(s)")
         fullname = f"{first} {last}".strip()
+        date_of_birth = get_field(fields, "Date of Birth")
         if not fullname:
             log(f"Skipping {airtable_id}: no full name")
             continue
@@ -1409,6 +1551,21 @@ for record in records:
 
                         mark_and_move_to_cleanup(other_card)
                         break
+        # Keep Airtable Date of Birth in a Trello custom field only.
+        # It is intentionally not written into the card name, description, or comments.
+        if dob_custom_field_id:
+            try:
+                set_card_date_of_birth(
+                    card_id=card_id,
+                    custom_field_id=dob_custom_field_id,
+                    airtable_dob=date_of_birth,
+                )
+            except Exception as exc:
+                log(
+                    f"Could not update Date of Birth custom field for card {card_id}: {exc}",
+                    "error",
+                )
+
         # If updating, use retained copy
         if not referral_drive_link:
             referral_drive_link = retained_referral_link
