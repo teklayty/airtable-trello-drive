@@ -1,14 +1,32 @@
+#!/usr/init/env python3
+"""
+Airtable MCP to Trello Sync Pipeline (Smart Fallback Version)
+-------------------------------------------------------------
+Configured with smart phone regex fallback and flexible field parsing 
+to match the successful individual script behavior.
+"""
+
+import asyncio
+import json
+import logging
 import os
 import re
-import requests
-from datetime import datetime, timedelta, timezone
-from dateutil.parser import parse as parse_iso
-import logging
-import urllib.parse
-import json
-import base64
+import sys
 import time
+import urllib.parse
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
+import httpx2
+import requests
+from dateutil.parser import parse as parse_iso
+from pydantic import AnyUrl
+
+from mcp import ClientSession
+from mcp.client.auth import AuthorizationCodeResult, OAuthClientProvider
+from mcp.client.streamable_http import streamable_http_client
+from mcp.shared.auth import OAuthClientMetadata, OAuthToken
 
 # =========================================================
 # CONFIG
@@ -17,34 +35,26 @@ import time
 TRELLO_API_KEY = os.getenv("TRELLO_API_KEY")
 TRELLO_API_TOKEN = os.getenv("TRELLO_API_TOKEN")
 
-# Trello custom field used to store Airtable Date of Birth.
-# display_cardFront=False keeps the DOB off the card front.
-TRELLO_DOB_CUSTOM_FIELD_NAME = os.getenv("TRELLO_DOB_CUSTOM_FIELD_NAME", "Date of Birth")
-
 CREATE_LIST_ID = os.getenv("TRELLO_CREATE_LIST_ID")
-EXISTING_LIST_IDS = os.getenv("TRELLO_EXISTING_LIST_IDS")
+EXISTING_LIST_IDS = os.getenv("TRELLO_EXISTING_LIST_IDS", "")
 RAW_ALLOWED_STAFF = os.getenv("TRELLO_ALLOWED_STAFF", "")
 
-AIRTABLE_TOKEN = os.getenv("AIRTABLE_TOKEN")
-
-AIRTABLE_BASE_ID = os.getenv("AIRTABLE_BASE_ID")
-AIRTABLE_TABLE_ID = os.getenv("AIRTABLE_TABLE_ID")
-AIRTABLE_VIEW_ID = os.getenv("AIRTABLE_VIEW_ID")
+AIRTABLE_MCP_URL = os.getenv("AIRTABLE_MCP_URL", "https://mcp.airtable.com/mcp")
+AIRTABLE_BASE_ID = os.getenv("AIRTABLE_BASE_ID", "appt4PI9krGalheLk")
+AIRTABLE_TABLE_ID = os.getenv("AIRTABLE_TABLE_ID", "tblPBsPUOoPDzknkj")
+AIRTABLE_INTERFACE_ID = os.getenv("AIRTABLE_INTERFACE_ID", "pbdDOjqDonDnlt0nx")
+AIRTABLE_PAGE_ID = os.getenv("AIRTABLE_PAGE_ID", "pagLtfDQqmKmrEIBa")
 
 URGENT_LIST_NAME = "URGENT – Eviction within 14 days"
-
 BASE_URL = "https://api.trello.com/1"
-
 AUTH = {"key": TRELLO_API_KEY, "token": TRELLO_API_TOKEN}
 
-AIRTABLE_HEADERS = {"Authorization": f"Bearer {AIRTABLE_TOKEN}"}
-
 # =========================================================
-# NEW SETUP AFTER AIRTABLE CHANGES for CoSS/SCC/CAS Notes
+# NOTES & DRIVE CONFIG
 # =========================================================
 AIRTABLE_NOTES_PAGE_ID = os.getenv(
     "AIRTABLE_NOTES_PAGE_ID",
-    "pagLsUMtGqYgvu2a5"
+    "pagLtfDQqmKmrEIBa"
 )
 
 AIRTABLE_NOTES_PARAM = os.getenv(
@@ -52,13 +62,8 @@ AIRTABLE_NOTES_PARAM = os.getenv(
     "Pwx3z"
 )
 
-# Marker used so the Airtable sync can update only its own Trello comment.
-# Comments created by WhatsApp, operators, or other systems are preserved.
-AIRTABLE_COMMENT_MARKER = f"📌**SU AIRTABLE Record and Drive Docs**"
+AIRTABLE_COMMENT_MARKER = "📌**SU AIRTABLE Record and Drive Docs**"
 
-# Temporary root folder currently used for SPRING client documents.
-# This is informational only: we do NOT use the root folder as a substitute
-# for a missing client-specific Link value in Airtable.
 GOOGLE_DRIVE_ROOT_FOLDER_ID = os.getenv(
     "GOOGLE_DRIVE_ROOT_FOLDER_ID",
     "17QIHfTwZtPAv3o3Nhur4AOYJzq8e13So"
@@ -68,9 +73,6 @@ GOOGLE_DRIVE_ROOT_FOLDER_URL = (
     f"{GOOGLE_DRIVE_ROOT_FOLDER_ID}?usp=drive_link"
 )
 
-# Optional Google Drive access used only to determine whether a linked client
-# folder actually contains anything. Prefer a service-account JSON file; an
-# API key can be used only where the folder is accessible as public data.
 GOOGLE_DRIVE_CREDENTIALS_FILE = os.getenv(
     "GOOGLE_DRIVE_CREDENTIALS_FILE",
     os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "")
@@ -83,17 +85,20 @@ GOOGLE_DRIVE_SCOPE = "https://www.googleapis.com/auth/drive.readonly"
 DRIVE_NO_LINK_LABEL = "No Drive Link"
 DRIVE_FOLDER_EMPTY_LABEL = "Drive Folder Empty"
 
-
-TODAY = datetime.now()
 RECENT_ARCHIVE_DAYS = 10
-TWO_MONTHS_AGO = TODAY - timedelta(days=60)
 
 ALLOWED_STAFF = {s.strip().lower() for s in RAW_ALLOWED_STAFF.split(",") if s.strip()}
-
 EXISTING_LIST_IDS = [lid.strip() for lid in EXISTING_LIST_IDS.split(",") if lid.strip()]
-
 CLEANUP_LIST_ID = os.getenv("TRELLO_CLEANUP_LIST_ID")
 
+READ_ONLY_SCOPES = (
+    "data.records:read "
+    "schema.bases:read "
+    "data.recordComments:read "
+    "workspacesAndBases:read"
+)
+
+TOKEN_FILE = Path(__file__).parent / ".airtable_tokens.json"
 
 # =========================================================
 # LOGGING SETUP
@@ -116,11 +121,174 @@ def log(msg, level="info"):
         logging.warning(msg)
 
 # =========================================================
-# HELPERS
+# PERSISTENT OAUTH TOKEN STORAGE FOR MCP
 # =========================================================
 
-def encode_airtable_id(record_id):
-    return base64.urlsafe_b64encode(record_id.encode()).decode()
+class PersistentTokenStorage:
+    def __init__(self, token_path: Path):
+        self.token_path = token_path
+
+    async def get_tokens(self) -> OAuthToken | None:
+        if not self.token_path.exists():
+            return None
+        try:
+            data = json.loads(self.token_path.read_text(encoding="utf-8"))
+            return OAuthToken(
+                access_token=data.get("access_token"),
+                refresh_token=data.get("refresh_token"),
+                token_type=data.get("token_type", "Bearer"),
+                expires_in=data.get("expires_in"),
+            )
+        except Exception as e:
+            log(f"Could not load saved tokens: {e}", "warning")
+            return None
+
+    async def set_tokens(self, tokens: OAuthToken) -> None:
+        try:
+            data = {
+                "access_token": tokens.access_token,
+                "refresh_token": tokens.refresh_token,
+                "token_type": tokens.token_type,
+                "expires_in": tokens.expires_in,
+            }
+            self.token_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        except Exception as e:
+            log(f"Could not save tokens to disk: {e}", "error")
+
+    async def get_client_info(self):
+        return None
+
+    async def set_client_info(self, client_info):
+        pass
+
+
+class CallbackCapture:
+    def __init__(self):
+        self.callback_url = None
+
+    async def __call__(self, url):
+        print("\n[First-time setup] Open this Airtable OAuth URL in your browser:")
+        print("=" * 78)
+        print(url)
+        print("=" * 78)
+        self.callback_url = input("\nPaste the FULL localhost:3030/callback URL here: ").strip()
+
+
+async def run_oauth_mcp_session(work_callback):
+    callback = CallbackCapture()
+
+    async def redirect_handler(url):
+        await callback(url)
+
+    async def callback_handler():
+        if not callback.callback_url:
+            raise RuntimeError("OAuth callback URL was not supplied.")
+        parsed = urlparse(callback.callback_url)
+        params = parse_qs(parsed.query)
+        if params.get("error"):
+            raise RuntimeError(params.get("error_description", params["error"])[0])
+        code = params.get("code", [None])[0]
+        state = params.get("state", [None])[0]
+        iss = params.get("iss", [None])[0]
+        if not code:
+            raise RuntimeError("OAuth callback URL did not contain a code.")
+        return AuthorizationCodeResult(code=code, state=state, iss=iss)
+
+    provider = OAuthClientProvider(
+        server_url=AIRTABLE_MCP_URL,
+        client_metadata=OAuthClientMetadata(
+            client_name="Airtable Trello Interface Sync",
+            redirect_uris=[AnyUrl("http://localhost:3030/callback")],
+            grant_types=["authorization_code", "refresh_token"],
+            response_types=["code"],
+            token_endpoint_auth_method="none",
+            scope=READ_ONLY_SCOPES,
+        ),
+        storage=PersistentTokenStorage(TOKEN_FILE),
+        redirect_handler=redirect_handler,
+        callback_handler=callback_handler,
+    )
+
+    timeout = httpx2.Timeout(30.0, read=300.0)
+
+    async with httpx2.AsyncClient(auth=provider, timeout=timeout) as http_client:
+        async with streamable_http_client(AIRTABLE_MCP_URL, http_client=http_client) as (read_stream, write_stream):
+            async with ClientSession(read_stream, write_stream) as session:
+                await session.initialize()
+                await work_callback(session)
+
+
+async def call_mcp_structured(session, tool_name, arguments):
+    result = await session.call_tool(tool_name, arguments)
+    structured = getattr(result, "structuredContent", None) or getattr(result, "structured_content", None)
+    if structured is not None:
+        return structured
+
+    for item in getattr(result, "content", []):
+        text = getattr(item, "text", None)
+        if not text:
+            continue
+        try:
+            return json.loads(text)
+        except Exception:
+            pass
+    return None
+
+# =========================================================
+# MCP RECORD FETCHING
+# =========================================================
+
+async def airtable_mcp_get_all_records(session, limit=2000):
+    log("Fetching records via Airtable Interface MCP...")
+    
+    payload = await call_mcp_structured(
+        session,
+        "list_records_for_page",
+        {
+            "baseId": AIRTABLE_BASE_ID,
+            "interfaceId": AIRTABLE_INTERFACE_ID,
+            "pageId": AIRTABLE_PAGE_ID,
+        }
+    )
+
+    if not isinstance(payload, dict):
+        log("Failed to fetch structured records from MCP response.", "error")
+        return []
+
+    by_table = payload.get("recordsByTableId", {})
+    raw_records = by_table.get(AIRTABLE_TABLE_ID, [])
+    
+    if not isinstance(raw_records, list):
+        if isinstance(by_table, dict) and len(by_table) > 0:
+            raw_records = next(iter(by_table.values()))
+        else:
+            raw_records = []
+
+    formatted_records = []
+    for rec in raw_records:
+        rec_id = rec.get("id")
+        cell_map = rec.get("cellValuesByFieldId", {})
+        
+        fields = {}
+        if isinstance(cell_map, dict):
+            for fid, val in cell_map.items():
+                fields[fid] = val
+
+        if "fields" in rec and isinstance(rec["fields"], dict):
+            fields.update(rec["fields"])
+
+        formatted_records.append({
+            "id": rec_id,
+            "createdTime": rec.get("createdTime", datetime.now(timezone.utc).isoformat()),
+            "fields": fields,
+        })
+
+    log(f"Fetched {len(formatted_records)} Airtable records via Interface MCP")
+    return formatted_records[:limit]
+
+# =========================================================
+# HELPERS
+# =========================================================
 
 def parse_date(value):
     if not value:
@@ -134,111 +302,114 @@ def parse_date(value):
     return None
 
 def extract_airtable_id_from_card(value):
-    print("=" * 60)
-    print(f"DEBUG: Raw input: {value}")
-    
+    if isinstance(value, dict):
+        value = value.get("desc", "") or value.get("name", "")
     if not value:
-        print("DEBUG: Value is empty or None")
         return ""
-    
     value = str(value)
-    print(f"DEBUG: Cast to string: {value}")
-    
     match = re.search(r"(rec[a-zA-Z0-9]{14})", value)
-    
-    if match:
-        airtable_id = match.group(1)
-        print(f"DEBUG: Match found: {airtable_id}")
-        return airtable_id
-    else:
-        print("DEBUG: No match found")
-        return ""
+    return match.group(1) if match else ""
 
-def get_field(fields, key):
-    value = fields.get(key, "")
-    if isinstance(value, list):
-        return ", ".join(map(str, value))
-    return str(value).strip()
+def get_field(fields, *keys):
+    priority_keys = ["fld7l03Yg7qOpECmp", "fldW1oINrdIcidIWx", "fldmnUq5R51iXqDuf"] + list(keys)
+    for key in priority_keys:
+        if key in fields:
+            value = fields[key]
+            if isinstance(value, list):
+                return ", ".join(map(str, value))
+            val_str = str(value).strip()
+            if val_str:
+                return val_str
+    return ""
 
-def build_airtable_link(record_id):
-    return build_notes_link(record_id)
+def verify_staff_allowed(fields, allowed_staff_set):
+    """Verifies staff using 'Staff/Volunteer Name' or linked record IDs."""
+    if not allowed_staff_set:
+        return True
 
+    staff_val = get_field(fields, "Staff/Volunteer Name", "(IA) Name of staff/volunteer", "Staff", "fldStaff").lower()
+    if staff_val:
+        if staff_val in allowed_staff_set:
+            return True
+        for allowed in allowed_staff_set:
+            if allowed in staff_val:
+                return True
 
-def get_case_status(eviction_date):
-    if not eviction_date:
-        return "🟡 Pending documents"
-    days = (eviction_date - TODAY).days
-    if days < 0 or days < 14:
-        return "🔴 Urgent eviction"
-    if days < 30:
-        return "🟡 Pending documents"
-    return "🟢 Active"
+    for val in fields.values():
+        if not val:
+            continue
+        val_str = str(val)
+        found_rec_ids = re.findall(r"(rec[a-zA-Z0-9]{14})", val_str, re.IGNORECASE)
+        for rec_id in found_rec_ids:
+            if rec_id.lower() in allowed_staff_set:
+                return True
+                
+    return False
+
+def build_notes_link(record_id):
+    return (
+        f"https://airtable.com/"
+        f"{AIRTABLE_BASE_ID}/"
+        f"{AIRTABLE_NOTES_PAGE_ID}"
+        f"?{AIRTABLE_NOTES_PARAM}={record_id}"
+    )
 
 def calculate_card_position(created_at):
-    """
-    Return a stable Trello position based on the Airtable record creation time.
-
-    The client cards are ordered chronologically Old -> New.  The first card
-    in the list is reserved for the instruction card, so all client-card
-    positions are deliberately greater than zero.
-    """
     if not created_at:
         return 10**12
-
     if created_at.tzinfo is not None:
         created_at = created_at.astimezone(timezone.utc).replace(tzinfo=None)
-
-    # Trello sorts numeric positions from low to high.  Using the timestamp
-    # gives a deterministic Old -> New order without disturbing the instruction
-    # card at the top of the list.
     return created_at.timestamp() + 1
 
+def build_prefill_form_link(fullname, airtable_id):
+    base_url = (
+        "https://airtable.com/"
+        "appt4PI9krGalheLk/"
+        "pag30p3pX8fc0lFkn/form"
+    )
+    value = f"{fullname} ({airtable_id})"
+    encoded_value = urllib.parse.quote(value)
+    return (
+        f"{base_url}"
+        f"?prefill_Client%20ID%20and%20Full%20Name={encoded_value}"
+    )
 
-def generate_notes_anchor_link(record_id):
-    return build_notes_link(record_id)
+def get_retained_referral_link(card_id):
+    try:
+        card = trello_get(f"/cards/{card_id}", {"fields": "desc"})
+        desc = card.get("desc", "")
+        lines = desc.splitlines()
+        for i, line in enumerate(lines):
+            if "REFERRAL_DOCUMENTS:" in line:
+                if i + 1 < len(lines):
+                    url = lines[i + 1].strip()
+                    if "drive.google.com" in url:
+                        return url
+    except Exception as e:
+        log(f"Could not read retained referral link: {e}", "error")
+    return ""
 
-
-
-# notes_link = build_notes_link(record_id)
-
-
-def generate_interface_link(record_id):
-    return build_notes_link(record_id)
-
-
-# =========================================================
-# LABELING CARDS IF NO REFERRAL TO COUNCIL
-# =========================================================
 def extract_drive_folder_id(value):
-    """Extract a Google Drive folder ID from a client Drive URL."""
     if not value:
         return ""
-
     value = str(value).strip()
     if not value:
         return ""
-
     patterns = (
         r"drive\.google\.com/drive/folders/([a-zA-Z0-9_-]+)",
         r"[?&]id=([a-zA-Z0-9_-]+)",
     )
-
     for pattern in patterns:
         match = re.search(pattern, value)
         if match:
             return match.group(1)
-
     return ""
-
 
 _drive_access_token = None
 _drive_access_token_expires_at = 0
 
-
 def get_google_drive_access_token():
-    """Return a short-lived Google Drive API access token, when configured."""
     global _drive_access_token, _drive_access_token_expires_at
-
     now = int(time.time())
     if _drive_access_token and now < (_drive_access_token_expires_at - 60):
         return _drive_access_token
@@ -254,19 +425,11 @@ def get_google_drive_access_token():
         client_email = credentials.get("client_email")
         private_key = credentials.get("private_key")
         if not client_email or not private_key:
-            log(
-                "Google Drive credentials file is missing client_email or private_key",
-                "warning"
-            )
             return ""
 
         try:
             import jwt
         except ImportError:
-            log(
-                "PyJWT is not installed; cannot authenticate to Google Drive API",
-                "warning"
-            )
             return ""
 
         issued_at = now
@@ -279,7 +442,6 @@ def get_google_drive_access_token():
         }
 
         assertion = jwt.encode(payload, private_key, algorithm="RS256")
-
         response = requests.post(
             GOOGLE_DRIVE_TOKEN_URL,
             data={
@@ -296,24 +458,17 @@ def get_google_drive_access_token():
             token_data.get("expires_in", 3600)
         )
         return _drive_access_token
-
     except Exception as e:
         log(f"Could not obtain Google Drive access token: {e}", "warning")
         return ""
 
-
 def check_google_drive_folder_status(gdrive_link):
-    """Return missing/empty/nonempty/unknown for a linked client Drive folder."""
     value = str(gdrive_link or "").strip()
     if value.lower() in {"", "none", "null", "n/a", "na", "-"}:
         return "missing"
 
     folder_id = extract_drive_folder_id(value)
     if not folder_id:
-        log(
-            f"Airtable Link is not a valid Google Drive folder link: {value}",
-            "warning"
-        )
         return "missing"
 
     params = {
@@ -327,18 +482,11 @@ def check_google_drive_folder_status(gdrive_link):
     try:
         access_token = get_google_drive_access_token()
         headers = {}
-
         if access_token:
             headers["Authorization"] = f"Bearer {access_token}"
         elif GOOGLE_DRIVE_API_KEY:
             params["key"] = GOOGLE_DRIVE_API_KEY
         else:
-            log(
-                "Google Drive folder check skipped: no "
-                "GOOGLE_DRIVE_CREDENTIALS_FILE/GOOGLE_APPLICATION_CREDENTIALS "
-                "or GOOGLE_DRIVE_API_KEY configured",
-                "warning"
-            )
             return "unknown"
 
         response = requests.get(
@@ -349,23 +497,13 @@ def check_google_drive_folder_status(gdrive_link):
         )
         response.raise_for_status()
         files = response.json().get("files", [])
-
-        if files:
-            return "nonempty"
-        return "empty"
-
+        return "nonempty" if files else "empty"
     except Exception as e:
-        log(
-            f"Could not check Google Drive folder {folder_id}: {e}",
-            "warning"
-        )
+        log(f"Could not check Google Drive folder {folder_id}: {e}", "warning")
         return "unknown"
 
-
 def ensure_drive_status_label(card_id, gdrive_link):
-    """Maintain Trello labels for missing or empty client Drive folders."""
     labels = trello_get(f"/cards/{card_id}/labels")
-
     existing = {lbl.get("name"): lbl for lbl in labels}
     no_link_label = existing.get(DRIVE_NO_LINK_LABEL)
     empty_label = existing.get(DRIVE_FOLDER_EMPTY_LABEL)
@@ -375,215 +513,41 @@ def ensure_drive_status_label(card_id, gdrive_link):
 
     if status == "missing":
         if empty_label:
-            trello_delete(
-                f"/cards/{card_id}/idLabels/{empty_label['id']}"
-            )
+            trello_delete(f"/cards/{card_id}/idLabels/{empty_label['id']}")
         if not no_link_label:
-            trello_post(
-                f"/cards/{card_id}/labels",
-                {
-                    "name": DRIVE_NO_LINK_LABEL,
-                    "color": "red"
-                }
-            )
-        log(
-            f"⚠️ {DRIVE_NO_LINK_LABEL}: no client Drive link for card {card_id}. "
-            f"Temporary Drive root: {GOOGLE_DRIVE_ROOT_FOLDER_URL}",
-            "warning"
-        )
+            trello_post(f"/cards/{card_id}/labels", {"name": DRIVE_NO_LINK_LABEL, "color": "red"})
         return
 
     if status == "empty":
         if no_link_label:
-            trello_delete(
-                f"/cards/{card_id}/idLabels/{no_link_label['id']}"
-            )
+            trello_delete(f"/cards/{card_id}/idLabels/{no_link_label['id']}")
         if not empty_label:
-            trello_post(
-                f"/cards/{card_id}/labels",
-                {
-                    "name": DRIVE_FOLDER_EMPTY_LABEL,
-                    "color": "yellow"
-                }
-            )
-        log(
-            f"⚠️ {DRIVE_FOLDER_EMPTY_LABEL}: linked client folder is empty "
-            f"for card {card_id}",
-            "warning"
-        )
+            trello_post(f"/cards/{card_id}/labels", {"name": DRIVE_FOLDER_EMPTY_LABEL, "color": "yellow"})
         return
 
     if status == "nonempty":
         if no_link_label:
-            trello_delete(
-                f"/cards/{card_id}/idLabels/{no_link_label['id']}"
-            )
+            trello_delete(f"/cards/{card_id}/idLabels/{no_link_label['id']}")
         if empty_label:
-            trello_delete(
-                f"/cards/{card_id}/idLabels/{empty_label['id']}"
-            )
-        log(f"✅ Client Drive folder contains content for card {card_id}")
+            trello_delete(f"/cards/{card_id}/idLabels/{empty_label['id']}")
         return
-
-    # Unknown: leave existing status labels untouched so a temporary API
-    # outage does not erase a previously detected warning.
-    log(
-        f"Drive status could not be determined for card {card_id}; "
-        "existing Drive status labels were left unchanged",
-        "warning"
-    )
-
 
 def ensure_referral_label(card_id, referral_requested_date):
     labels = trello_get(f"/cards/{card_id}/labels")
-
-    referral_label = None
-
-    for lbl in labels:
-        if lbl.get("name") == "No Referral made to SCC":
-            referral_label = lbl
-            break
+    referral_label = next((lbl for lbl in labels if lbl.get("name") == "No Referral made to SCC"), None)
 
     value = str(referral_requested_date).strip().lower()
-
-    has_referral = value not in {
-        "",
-        "none",
-        "null",
-        "[]"
-    }
-
-    log(
-        f"DEBUG referral value='{value}' "
-        f"has_referral={has_referral}"
-    )
+    has_referral = value not in {"", "none", "null", "[]"}
 
     if not has_referral:
         if not referral_label:
             trello_post(
                 f"/cards/{card_id}/labels",
-                {
-                    "name": "No Referral made to SCC",
-                    "color": "orange"
-                }
+                {"name": "No Referral made to SCC", "color": "orange"}
             )
-
     else:
         if referral_label:
-            trello_delete(
-                f"/cards/{card_id}/idLabels/{referral_label['id']}"
-            )
-
-
-
-# =========================================================
-# Airtable Comments API Function
-# =========================================================
-
-def get_airtable_comments(record_id):
-    """
-    Fetch comments from Airtable (includes timestamps)
-    """
-    url = f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{AIRTABLE_TABLE_ID}/{record_id}/comments"
-
-    r = requests.get(url, headers=AIRTABLE_HEADERS)
-    r.raise_for_status()
-
-    data = r.json()
-    return data.get("comments", [])
-
-
-# =========================================================
-# Airtable NOTES LINKS ON Comments
-# =========================================================
-def build_notes_link(record_id):
-    return (
-        f"https://airtable.com/"
-        f"{AIRTABLE_BASE_ID}/"
-        f"{AIRTABLE_NOTES_PAGE_ID}"
-        f"?{AIRTABLE_NOTES_PARAM}={record_id}"
-    )
-
-
-# =========================================================
-# Open CoSS Support for client
-# ========================================================= 
-def build_prefill_form_link(fullname, airtable_id):
-    base_url = (
-        "https://airtable.com/"
-        "appt4PI9krGalheLk/"
-        "pag30p3pX8fc0lFkn/form"
-    )
-
-    value = f"{fullname} ({airtable_id})"
-    encoded_value = urllib.parse.quote(value)
-
-    return (
-        f"{base_url}"
-        f"?prefill_Client%20ID%20and%20Full%20Name={encoded_value}"
-    )
-
-# =========================================================
-# GET RETAINED REFERRAL LINK
-# ========================================================= 
-def get_retained_referral_link(card_id):
-
-    try:
-        card = trello_get(
-            f"/cards/{card_id}",
-            {"fields": "desc"}
-        )
-
-        desc = card.get("desc", "")
-
-        lines = desc.splitlines()
-
-        for i, line in enumerate(lines):
-
-            if "REFERRAL_DOCUMENTS:" in line:
-
-                if i + 1 < len(lines):
-
-                    url = lines[i + 1].strip()
-
-                    if "drive.google.com" in url:
-                        return url
-
-    except Exception as e:
-        log(f"Could not read retained referral link: {e}", "error")
-
-    return ""
-
-
-
-# =========================================================
-# Format Comments Nicely
-# =========================================================
-
-def format_airtable_comments(comments):
-    """
-    Format Airtable comments into clean Markdown for Trello
-    """
-    if not comments:
-        return ""
-
-    lines = []
-
-    for c in comments:
-        text = c.get("text", "").strip()
-        created = c.get("createdTime", "")
-
-        # Format timestamp nicely
-        try:
-            dt = parse_iso(created)
-            created_str = dt.strftime("%d %b %Y, %H:%M")
-        except:
-            created_str = created
-
-        lines.append(f"- 🕒 {created_str}\n  {text}")
-
-    return "\n\n".join(lines)
-
+            trello_delete(f"/cards/{card_id}/idLabels/{referral_label['id']}")
 
 # =========================================================
 # TRELLO API
@@ -593,263 +557,64 @@ def trello_get(path, extra_params=None):
     params = dict(AUTH)
     if extra_params:
         params.update(extra_params)
-    r = requests.get(f"{BASE_URL}{path}", params=params)
+    r = requests.get(f"{BASE_URL}{path}", params=params, timeout=30)
     r.raise_for_status()
     return r.json()
 
 def trello_post(path, data):
-    r = requests.post(f"{BASE_URL}{path}", params=AUTH, data=data)
+    r = requests.post(f"{BASE_URL}{path}", params=AUTH, data=data, timeout=30)
     r.raise_for_status()
     return r.json()
 
 def trello_put(path, data):
-    r = requests.put(f"{BASE_URL}{path}", params=AUTH, data=data)
+    r = requests.put(f"{BASE_URL}{path}", params=AUTH, data=data, timeout=30)
     r.raise_for_status()
     return r.json()
 
 def trello_delete(path):
-    r = requests.delete(f"{BASE_URL}{path}", params=AUTH)
+    r = requests.delete(f"{BASE_URL}{path}", params=AUTH, timeout=30)
     r.raise_for_status()
-
-
-def trello_post_json(path, data):
-    """POST a JSON payload to Trello."""
-    r = requests.post(
-        f"{BASE_URL}{path}",
-        params=AUTH,
-        json=data,
-        headers={"Accept": "application/json", "Content-Type": "application/json"},
-    )
-    r.raise_for_status()
-    return r.json() if r.text else {}
-
-
-def trello_put_json(path, data):
-    """PUT a JSON payload to Trello."""
-    r = requests.put(
-        f"{BASE_URL}{path}",
-        params=AUTH,
-        json=data,
-        headers={"Accept": "application/json", "Content-Type": "application/json"},
-    )
-    r.raise_for_status()
-    return r.json() if r.text else {}
-
-# =========================================================
-# TRELLO DATE OF BIRTH CUSTOM FIELD
-# =========================================================
-
-def normalize_airtable_dob(value):
-    """Convert an Airtable DOB value into Trello's ISO date value."""
-    raw = str(value or "").strip()
-    if raw.lower() in {"", "none", "null", "n/a", "na", "-", "[]"}:
-        return None
-
-    for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%Y/%m/%d", "%d-%m-%Y"):
-        try:
-            dt = datetime.strptime(raw, fmt)
-            return dt.strftime("%Y-%m-%dT00:00:00.000Z")
-        except ValueError:
-            pass
-
-    try:
-        dt = parse_iso(raw, dayfirst=True)
-        return dt.strftime("%Y-%m-%dT00:00:00.000Z")
-    except Exception:
-        log(f"Could not parse Airtable Date of Birth value {raw!r}", "warning")
-        return None
-
-
-def get_or_create_dob_custom_field(board_id):
-    """Find the board Date of Birth field or create it as a hidden date field."""
-    if not board_id:
-        raise ValueError("Cannot create/find DOB custom field without a Trello board ID.")
-
-    wanted = TRELLO_DOB_CUSTOM_FIELD_NAME.strip().lower()
-    fields = trello_get(f"/boards/{board_id}/customFields") or []
-
-    for field in fields:
-        name = str(field.get("name") or "").strip()
-        if name.lower() != wanted:
-            continue
-
-        field_id = field.get("id")
-        field_type = str(field.get("type") or "").lower()
-        if not field_id:
-            continue
-        if field_type != "date":
-            raise RuntimeError(
-                f"Trello custom field {name!r} already exists but is type {field_type!r}, not date."
-            )
-
-        # Keep DOB off the card front.
-        display = field.get("display") or {}
-        if display.get("cardFront") is not False:
-            try:
-                trello_put_json(
-                    f"/customFields/{field_id}",
-                    {"display/cardFront": False},
-                )
-                log(f"Set Trello DOB custom field {field_id} to hidden on card front")
-            except Exception as exc:
-                log(
-                    f"Could not hide Trello DOB custom field {field_id}: {exc}",
-                    "warning",
-                )
-        return field_id
-
-    created = trello_post_json(
-        "/customFields",
-        {
-            "idModel": board_id,
-            "modelType": "board",
-            "name": TRELLO_DOB_CUSTOM_FIELD_NAME,
-            "type": "date",
-            "pos": "top",
-            "display_cardFront": False,
-        },
-    )
-
-    field_id = created.get("id")
-    if not field_id:
-        raise RuntimeError("Trello created the DOB custom field without returning an ID.")
-
-    log(
-        f"Created Trello Date of Birth custom field: name={TRELLO_DOB_CUSTOM_FIELD_NAME!r} "
-        f"id={field_id} display_cardFront=False"
-    )
-    return field_id
-
-
-def set_card_date_of_birth(card_id, custom_field_id, airtable_dob):
-    """Write or clear the Airtable Date of Birth on a Trello card."""
-    if not card_id or not custom_field_id:
-        return False
-
-    dob_iso = normalize_airtable_dob(airtable_dob)
-    payload = {"value": {"date": dob_iso}} if dob_iso else {"idValue": "", "value": ""}
-
-    trello_put_json(
-        f"/cards/{card_id}/customField/{custom_field_id}/item",
-        payload,
-    )
-
-    if dob_iso:
-        log(f"Updated Trello Date of Birth: card={card_id} dob={dob_iso[:10]}")
-    else:
-        log(f"Cleared Trello Date of Birth: card={card_id}")
-
-    return True
 
 # =========================================================
 # COMMENTS
 # =========================================================
 
 def get_airtable_comment_actions(card_id):
-    """Return all Airtable-sync-owned Trello comment actions for a card."""
-    actions = trello_get(
-        f"/cards/{card_id}/actions",
-        {
-            "filter": "commentCard",
-            "limit": 1000,
-        }
-    )
-
-    owned = []
-    for action in actions:
-        text = action.get("data", {}).get("text", "")
-        if AIRTABLE_COMMENT_MARKER in text:
-            owned.append(action)
-
-    return owned
-
+    actions = trello_get(f"/cards/{card_id}/actions", {"filter": "commentCard", "limit": 1000})
+    return [a for a in actions if AIRTABLE_COMMENT_MARKER in a.get("data", {}).get("text", "")]
 
 def get_card_comment_actions(card_id):
-    """Return recent comment actions for a card, newest first."""
-    return trello_get(
-        f"/cards/{card_id}/actions",
-        {
-            "filter": "commentCard",
-            "limit": 1000,
-        }
-    )
-
+    return trello_get(f"/cards/{card_id}/actions", {"filter": "commentCard", "limit": 1000})
 
 def get_latest_non_airtable_comment(card_id):
-    """Return the newest non-Airtable comment action, if one exists."""
     actions = get_card_comment_actions(card_id)
-
     for action in actions:
         text = action.get("data", {}).get("text", "") or ""
         if AIRTABLE_COMMENT_MARKER not in text:
             return action
-
     return None
 
-
 def delete_airtable_comments(card_id, keep_action_id=None):
-    """Delete duplicate Airtable-sync comments only.
-
-    All other Trello comments (WhatsApp/operator/manual comments, etc.) are
-    left untouched. When keep_action_id is supplied, that single comment is
-    retained and every other Airtable-owned comment is deleted.
-    """
     actions = get_airtable_comment_actions(card_id)
-
     for action in actions:
         action_id = action.get("id")
         if keep_action_id and action_id == keep_action_id:
             continue
-
         try:
             trello_delete(f"/actions/{action_id}")
-            log(
-                f"Deleted duplicate Airtable sync comment "
-                f"{action_id} from card {card_id}"
-            )
-        except Exception as e:
-            log(
-                f"Could not delete Airtable sync comment {action_id}: {e}",
-                "error"
-            )
-
+        except Exception:
+            pass
 
 def delete_airtable_comment(card_id, action_id):
-    """Delete one specific Airtable-owned comment."""
     if not action_id:
         return
-
-    try:
-        trello_delete(f"/actions/{action_id}")
-        log(
-            f"Deleted Airtable sync comment {action_id} from card {card_id} "
-            "to promote it back to the top of the comment feed"
-        )
-    except Exception as e:
-        log(
-            f"Could not delete Airtable sync comment {action_id}: {e}",
-            "error"
-        )
-        raise
-
+    trello_delete(f"/actions/{action_id}")
 
 def update_airtable_comment(action_id, comment_text):
-    """Update an existing Airtable-owned Trello comment in place."""
-    r = trello_put(
-        f"/actions/{action_id}/comments",
-        {"text": comment_text}
-    )
-    return r
-
+    return trello_put(f"/actions/{action_id}/comments", {"text": comment_text})
 
 def create_airtable_comment(card_id, comment_text):
-    """Create a new Airtable-owned comment and return the Trello action."""
-    result = trello_post(
-        f"/cards/{card_id}/actions/comments",
-        {"text": comment_text}
-    )
-    return result
-
+    return trello_post(f"/cards/{card_id}/actions/comments", {"text": comment_text})
 
 def add_comment(
     card_id,
@@ -861,15 +626,9 @@ def add_comment(
     gdrive,
     fullname
 ):
-
-    # Only manage the Airtable-owned comment.
-    # Preserve WhatsApp/operator/manual comments on the same Trello card.
     existing_airtable_comments = get_airtable_comment_actions(card_id)
-
-    # Keep one Airtable comment if one already exists; remove any duplicates.
     keep_action_id = None
     if existing_airtable_comments:
-        # Keep the newest Airtable-owned comment.
         existing_airtable_comments.sort(
             key=lambda a: a.get("date", "") or a.get("id", ""),
             reverse=True
@@ -881,7 +640,6 @@ def add_comment(
     form_link = build_prefill_form_link(fullname, record_id)
 
     lines = [AIRTABLE_COMMENT_MARKER]
-
     lines.append(f"🟦 CoSS Notes:\n{notes_link}\n")
 
     if scc_notes and str(scc_notes).strip():
@@ -891,11 +649,8 @@ def add_comment(
         lines.append(f"🟩 CAS Notes:\n{notes_link}\n")
 
     drive_links = []
-
     if gdrive and str(gdrive).strip():
-        drive_links.append(
-            f"📁 Client Documents:\n{gdrive}"
-        )
+        drive_links.append(f"📁 Client Documents:\n{gdrive}")
 
     if drive_links:
         lines.append("")
@@ -909,12 +664,6 @@ def add_comment(
 
     comment_text = "\n".join(lines)
 
-    log("ABOUT TO POST/UPDATE COMMENT")
-    log(comment_text)
-
-    # Trello's comment actions are ordered newest first.  If a WhatsApp or
-    # other non-Airtable comment was added after our Airtable comment, recreate
-    # the Airtable comment so it becomes the newest/top comment again.
     promote_to_top = False
     if keep_action_id:
         try:
@@ -924,219 +673,81 @@ def add_comment(
 
             if latest_other_date and (not airtable_date or latest_other_date > airtable_date):
                 promote_to_top = True
-                log(
-                    f"PROMOTING AIRTABLE COMMENT TO TOP: card={card_id} "
-                    f"airtable_date={airtable_date} "
-                    f"latest_other_date={latest_other_date}"
-                )
         except Exception as e:
-            log(
-                f"Could not determine whether Airtable comment needs promotion "
-                f"on card {card_id}: {e}",
-                "warning"
-            )
+            log(f"Could not determine comment promotion order on card {card_id}: {e}", "warning")
 
     if promote_to_top:
         delete_airtable_comment(card_id, keep_action_id)
         create_airtable_comment(card_id, comment_text)
-        log("AIRTABLE COMMENT RECREATED AT TOP")
     elif keep_action_id:
         update_airtable_comment(keep_action_id, comment_text)
-        log(
-            f"AIRTABLE COMMENT UPDATED IN PLACE "
-            f"action={keep_action_id}"
-        )
     else:
         create_airtable_comment(card_id, comment_text)
-        log("AIRTABLE COMMENT CREATED")
 
-    log("COMMENT SYNC SUCCESSFUL")
+def clean_card(card_id):
+    for cl in trello_get(f"/cards/{card_id}/checklists"):
+        trello_delete(f"/checklists/{cl['id']}")
+    trello_put(f"/cards/{card_id}", {"desc": ""})
 
-
-def generate_note_links(record_id, coss_notes, scc_notes, cas_notes):
-    notes_link = build_notes_link(record_id)
-
-    links = []
-
-    if coss_notes and str(coss_notes).strip():
-        links.append(("🟦 CoSS Notes", notes_link))
-
-    if scc_notes and str(scc_notes).strip():
-        links.append(("🟨 SCC Notes", notes_link))
-
-    if cas_notes and str(cas_notes).strip():
-        links.append(("🟩 CAS Notes", notes_link))
-
-    return links
-
-
-def generate_section_links(record_id):
-    notes_link = build_notes_link(record_id)
-
-    return {
-        "coss": notes_link,
-        "scc": notes_link,
-        "cas": notes_link
-    }
-
-
-
-# =========================================================
-# ADD ATTACHMENTS
-# =========================================================    
-def add_attachments(card_id, record_id, fullname, gdrive):
-    delete_system_attachments(card_id)
-    return
-
-# =========================================================
-# GET DRIVE LINK
-# =========================================================  
-def get_drive_link_from_card(card_id):
-
-    try:
-        card = trello_get(
+def mark_and_move_to_cleanup(card):
+    card_id = card["id"]
+    labels = trello_get(f"/cards/{card_id}/labels")
+    if not any(lbl.get("name") == "Duplicate,Delete Me!" for lbl in labels):
+        trello_post(
+            f"/cards/{card_id}/labels",
+            {"name": "Duplicate,Delete Me!", "color": "black"}
+        )
+    if CLEANUP_LIST_ID and card.get("idList") != CLEANUP_LIST_ID:
+        trello_put(
             f"/cards/{card_id}",
-            {
-                "fields": "name,desc"
-            }
+            {"idList": CLEANUP_LIST_ID}
         )
 
-        desc = card.get("desc", "")
+def clean_phone(phone):
+    if not phone:
+        return ""
+    digits = re.sub(r"\D", "", str(phone))
+    if digits.startswith("00"):
+        digits = digits[2:]
+    if digits.startswith("44"):
+        return digits
+    if digits.startswith("0"):
+        return "44" + digits[1:]
+    if len(digits) >= 10:
+        return "44" + digits[-10:]
+    return digits
 
-        matches = re.findall(
-            r'https?://[^\s\]]+',
-            desc
-        )
-
-        log(f"CARD: {card['name']}")
-        log(f"URLS FOUND: {matches}")
-
-        for link in matches:
-
-            link = link.strip()
-            link = link.lstrip("[")
-            link = link.rstrip("]>.,)")
-
-            if (
-                "drive.google.com" in link
-                or "docs.google.com" in link
-            ):
-                log(f"✅ DRIVE LINK FOUND: {link}")
-                return link
-
-    except Exception as e:
-        log(f"Failed to extract Drive link: {e}", "error")
-
-    return ""
-
-
-
-
-
-
-
-# =========================================================
-# GET DRIVE ATTACHMENT
-# ========================================================= 
-def get_drive_attachment(card_id):
-    attachments = trello_get(
-        f"/cards/{card_id}/attachments"
-    )
-
-    for att in attachments:
-        url = att.get("url", "")
-
-        if "drive.google.com" in url:
-            return url
-
-    return None
-
-
-# =========================================================
-# AIRTABLE API
-# =========================================================
-
-def airtable_get_all_records(limit=60):
-    """
-    Fetch records exactly in the order they appear in the Airtable view.
-    No additional sorting is applied.
-    """
-    records = []
-    offset = None
-
-    while True:
-        url = f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{AIRTABLE_TABLE_ID}"
-
-        params = {
-            "view": AIRTABLE_VIEW_ID,
-            "pageSize": 100
-        }
-
-        if offset:
-            params["offset"] = offset
-
-        r = requests.get(
-            url,
-            headers=AIRTABLE_HEADERS,
-            params=params
-        )
-        r.raise_for_status()
-
-        data = r.json()
-
-        records.extend(data.get("records", []))
-
-        offset = data.get("offset")
-
-        if not offset:
-            break
-
-    log(f"Fetched {len(records)} Airtable records")
-
-    return records[:limit]
-
-# =========================================================
-# MOVE TO URGENT LIST
-# =========================================================
+def phone_matches(p1, p2):
+    if not p1 or not p2:
+        return False
+    return p1[-9:] == p2[-9:]
 
 def extract_phone_from_card(card):
     text = card.get("name", "") + " " + card.get("desc", "")
-
-    matches = re.findall(
-        r"(?:\+44|44|0)?[\d\s()\-]{9,}",
-        text
-    )
-
+    matches = re.findall(r"(?:\+44|44|0)?[\d\s()\-]{9,}", text)
     phones = []
-
     for match in matches:
         cleaned = clean_phone(match)
-
         if len(cleaned) >= 11:
             phones.append(cleaned)
+    return max(phones, key=len) if phones else ""
 
-    if not phones:
-        return ""
-
-    return max(phones, key=len)
-
-
-
-# =========================================================
-# LOAD EXISTING CARDS & CLEAN DUPLICATES
-# =========================================================
+def get_drive_link_from_card(card_id):
+    try:
+        card = trello_get(f"/cards/{card_id}", {"fields": "name,desc"})
+        desc = card.get("desc", "")
+        matches = re.findall(r'https?://[^\s\]]+', desc)
+        for link in matches:
+            link = link.strip().lstrip("[").rstrip("]>.,)")
+            if "drive.google.com" in link or "docs.google.com" in link:
+                return link
+    except Exception as e:
+        log(f"Failed to extract Drive link: {e}", "error")
+    return ""
 
 def load_existing_cards():
-    """
-    Load existing cards from Trello and index them by:
-    1. Airtable record ID
-    2. Phone number (for duplicate detection)
-
-    Also archives duplicate Airtable cards automatically.
-    """
     cards = {}
-    phone_index = {}   # ✅ NEW
-
+    phone_index = {}
     cutoff = datetime.now(timezone.utc) - timedelta(days=RECENT_ARCHIVE_DAYS)
 
     for lid in EXISTING_LIST_IDS:
@@ -1147,8 +758,6 @@ def load_existing_cards():
 
         for card in fetched_cards:
             is_archived = card.get("closed", False)
-
-            # Skip old archived cards
             if is_archived:
                 try:
                     last_activity = parse_iso(card["dateLastActivity"])
@@ -1157,537 +766,216 @@ def load_existing_cards():
                 except:
                     continue
 
-            # =====================================================
-            # ✅ Build PHONE INDEX (for duplicate detection)
-            # =====================================================
             phone = extract_phone_from_card(card)
-            log(f"Extracted phone from card '{card.get('name')}': {phone}")
-
-
             if phone:
                 if phone not in phone_index:
                     phone_index[phone] = []
                 phone_index[phone].append(card)
 
-            log(f"📞 Phone index built: { {k: len(v) for k,v in phone_index.items()} }")
-
-
-            # =====================================================
-            # ✅ Existing Airtable ID logic (unchanged)
-            # =====================================================
             airtable_id = extract_airtable_id_from_card(card)
             if not airtable_id:
                 continue
 
             if airtable_id in cards:
-                # Duplicate found — keep the most recent active card
                 existing_card = cards[airtable_id]["card"]
-
                 existing_last_activity = parse_iso(existing_card["dateLastActivity"])
                 current_last_activity = parse_iso(card["dateLastActivity"])
 
                 if current_last_activity > existing_last_activity:
                     trello_put(f"/cards/{existing_card['id']}", {"closed": "true"})
-                    log(
-                        f"⚠️ Archived older duplicate card: {existing_card['id']} "
-                        f"for Airtable ID {airtable_id}",
-                        "warning"
-                    )
                     cards[airtable_id] = {"card": card, "closed": is_archived}
                 else:
                     trello_put(f"/cards/{card['id']}", {"closed": "true"})
-                    log(
-                        f"⚠️ Archived duplicate card: {card['id']} "
-                        f"for Airtable ID {airtable_id}",
-                        "warning"
-                    )
                 continue
 
             cards[airtable_id] = {"card": card, "closed": is_archived}
-            log(f"FOUND EXISTING: {card.get('name')} | {airtable_id}")
 
-    # ✅ IMPORTANT: return BOTH
     return cards, phone_index
 
 # =========================================================
-# CLEAN CARD
+# MAIN EXECUTION VIA INTERFACE PAGE 2
 # =========================================================
 
-def clean_card(card_id):
-    for cl in trello_get(f"/cards/{card_id}/checklists"):
-        trello_delete(f"/checklists/{cl['id']}")
-    trello_put(f"/cards/{card_id}", {"desc": ""})
+async def execute_sync_pipeline(session):
+    log("🚀 Starting Optimized Airtable (Page 2 MCP) → Trello Sync")
+    existing_cards, phone_index = load_existing_cards()
 
-def phone_matches(p1, p2):
-    if not p1 or not p2:
-        return False
-    return p1[-9:] == p2[-9:]
+    records = await airtable_mcp_get_all_records(session, limit=2000)
 
+    created = updated = 0
 
-def delete_system_attachments(card_id):
-    attachments = trello_get(f"/cards/{card_id}/attachments")
+    for record in records:
+        try:
+            airtable_id = record.get("id")
+            fields = record.get("fields", {})
 
-    for att in attachments:
-        name = att.get("name", "")
+            created_at = parse_iso(record["createdTime"])
+            if created_at.tzinfo is None:
+                created_at = created_at.replace(tzinfo=timezone.utc)
 
-        # ✅ Only delete attachments created by your system
-        if any(keyword in name for keyword in [
-            "Airtable Record",
-            "Google Drive",
-            "CoSS Notes",
-            "SCC Notes",
-            "CAS Notes",
-            "CoSS Support Form"
-        ]):
-            try:
-                trello_delete(f"/cards/{card_id}/attachments/{att['id']}")
-            except Exception as e:
-                log(f"Could not delete attachment: {e}", "error")
+            first = get_field(fields, "Forename/First name(s)")
+            last = get_field(fields, "Surname/Last Name(s)")
+            fullname = f"{first} {last}".strip()
+            
+            if not fullname and "fld7l03Yg7qOpECmp" in fields:
+                fullname = str(fields["fld7l03Yg7qOpECmp"]).strip()
 
+            if not fullname:
+                log(f"Skipping {airtable_id}: no full name")
+                continue
 
-# =========================================================
-# MARK AND MOVE TO CLEANUP
-# =========================================================
-def mark_and_move_to_cleanup(card):
-    card_id = card["id"]
+            contact_phone = get_field(fields, "Contact number")
+            whatsapp_phone = get_field(fields, "WhatsApp number") or contact_phone
+            
+            # Smart fallback for bulk sync script
+            if not contact_phone and not whatsapp_phone:
+                for k, val in fields.items():
+                    if val:
+                        val_str = str(val)
+                        matches = re.findall(r"(?:07|\+447|447)\d{9}", val_str)
+                        if matches:
+                            contact_phone = matches[0]
+                            break
 
-    log(f"🧹 Marking as 'Delete Me': {card.get('name')}")
+            if not contact_phone and not whatsapp_phone:
+                log(f"Skipping {airtable_id}: no phone number", "warning")
+                continue
 
-    labels = trello_get(f"/cards/{card_id}/labels")
+            # Verify staff
+            if ALLOWED_STAFF and not verify_staff_allowed(fields, ALLOWED_STAFF):
+                log(f"⏭ Skipped record {airtable_id}: Staff not allowed", "warning")
+                continue
 
-    # ✅ Add "Delete Me!" label if missing
-    if not any(lbl.get("name") == "Delete Me!" for lbl in labels):
-        trello_post(
-            f"/cards/{card_id}/labels",
-            {"name": "Duplicate,Delete Me!", "color": "black"}
-        )
+            eviction_raw = get_field(fields, "MEARS Eviction Date")
+            eviction_date = parse_date(eviction_raw)
+            gdrive = get_field(fields, "Link")
 
-    # ✅ OPTIONAL: move to cleanup list (keep this if you want movement)
-    if CLEANUP_LIST_ID and card.get("idList") != CLEANUP_LIST_ID:
-        trello_put(
-            f"/cards/{card_id}",
-            {"idList": CLEANUP_LIST_ID}
-        )
+            whatsapp_number = clean_phone(whatsapp_phone or contact_phone)
+            card_name = f"{fullname} – Phone: {contact_phone} – Eviction date: {eviction_raw}"
 
+            spring_issue = get_field(fields, "SPRING - Issue^")
+            coss_support = get_field(fields, "CoSS Support Provided")
+            supporting_docs = get_field(fields, "Supporting Documents attached")
+            coss_notes = get_field(fields, "CoSS Notes")
+            scc_notes = get_field(fields, "SCC Notes")
+            cas_notes = get_field(fields, "CAS Notes")
+            last_modified = get_field(fields, "Last modified")
+            referral_drive_link = ""
+            referral_requested_date = get_field(fields, "SCC - Referral requested (date).")
 
-# =========================================================
-# NORMALIZE UK PHONE
-# =========================================================
-def clean_phone(phone):
-    if not phone:
-        return ""
+            retained_referral_link = ""
 
-    digits = re.sub(r"\D", "", str(phone))
+            if airtable_id in existing_cards:
+                existing = existing_cards[airtable_id]
+                card = existing["card"]
+                card_id = card["id"]
 
-    if digits.startswith("00"):
-        digits = digits[2:]
+                log(f"🔄 Updating existing card: {card_name}")
+                if existing["closed"]:
+                    trello_put(f"/cards/{card_id}", {"closed": "false"})
 
-    if digits.startswith("44"):
-        return digits
-
-    if digits.startswith("0"):
-        return "44" + digits[1:]
-
-    if len(digits) >= 10:
-        return "44" + digits[-10:]
-
-    return digits
-
-# =========================================================
-# MAIN
-# =========================================================
-
-log("🚀 Starting Optimized Airtable → Trello Sync")
-existing_cards, phone_index = load_existing_cards()
-
-
-# Find urgent list ID
-board_id = trello_get(f"/lists/{CREATE_LIST_ID}")["idBoard"]
-
-try:
-    dob_custom_field_id = get_or_create_dob_custom_field(board_id)
-except Exception as exc:
-    dob_custom_field_id = None
-    log(f"Could not initialise Trello Date of Birth custom field: {exc}", "error")
-
-urgent_list_id = None
-for lst in trello_get(f"/boards/{board_id}/lists"):
-    if lst["name"] == URGENT_LIST_NAME:
-        urgent_list_id = lst["id"]
-
-records = airtable_get_all_records(limit=60)
-
-log("========== FIRST RECORDS FROM AIRTABLE ==========")
-
-for i, r in enumerate(records, start=1):
-    fields = r.get("fields", {})
-
-    log(
-        f"{i:02d}. "
-        f"{r['id']} | "
-        f"createdTime={r.get('createdTime')} | "
-        f"Created={fields.get('Created')} | "
-        f"{fields.get('Forename/First name(s)', '')} "
-        f"{fields.get('Surname/Last Name(s)', '')}"
-    )
-
-log("===============================================")
-
-
-created = updated = 0
-
-for record in records:
-    try:
-        airtable_id = record.get("id")
-        fields = record.get("fields", {})
-
-        # created_at = parse_date(get_field(fields, "Created"))
-        created_at = parse_iso(record["createdTime"]).replace(tzinfo=None)
-        if created_at and created_at < TWO_MONTHS_AGO:
-            log(f"Skipping {airtable_id}: older than two months")
-            continue  # skip old records
-
-        first = get_field(fields, "Forename/First name(s)")
-        last = get_field(fields, "Surname/Last Name(s)")
-        fullname = f"{first} {last}".strip()
-        date_of_birth = get_field(fields, "Date of Birth")
-        if not fullname:
-            log(f"Skipping {airtable_id}: no full name")
-            continue
-
-        contact_phone = get_field(fields, "Contact number")
-        whatsapp_phone = get_field(fields, "WhatsApp number") or contact_phone
-        if not contact_phone and not whatsapp_phone:
-            log(f"Skipping {airtable_id}: no phone number")
-            continue
-
-        staff = get_field(fields, "(IA) Name of staff/volunteer").strip().lower()
-
-        
-        # Skip records where staff is not allowed
-        if staff not in ALLOWED_STAFF:
-            log(
-                f"⏭ Skipped record {airtable_id}: "
-                f"Staff '{staff}' not in allowed list",
-                "⚠️ warning"
-            )
-            continue
-        log(log("(IA) Name of staff/volunteer"))
-        
-        eviction_raw = get_field(fields, "MEARS Eviction Date")
-        eviction_date = parse_date(eviction_raw)
-        gdrive = get_field(fields, "Link")
-
-        airtable_link = build_airtable_link(airtable_id)
-        whatsapp_number = clean_phone(whatsapp_phone)
-
-        card_name = f"{fullname} – Phone: {contact_phone} – Eviction date: {eviction_raw}"
-
-        spring_issue = get_field(fields, "SPRING - Issue^")
-        coss_support = get_field(fields, "CoSS Support Provided")
-        supporting_docs = get_field(fields, "Supporting Documents attached")
-        coss_support_1y = get_field(fields, "CoSS Support Provided (1y)")
-        coss_notes = get_field(fields, "CoSS Notes")
-        scc_notes = get_field(fields, "SCC Notes")
-        cas_notes = get_field(fields, "CAS Notes")
-        last_modified = get_field(fields, "Last modified")
-        referral_drive_link = ""
-        referral_requested_date = get_field(
-            fields,
-            "SCC - Referral requested (date)."
-        )
-
-        # Using PHONE to detect duplications
-        ia_phone = whatsapp_phone
-
-        ia_clean = clean_phone(ia_phone)
-        wa_clean = clean_phone(whatsapp_phone)
-
-        print(f"IA: {ia_phone} -> {ia_clean}")
-        print(f"WA: {whatsapp_phone} -> {wa_clean}")
-        print(f"Match: {ia_clean == wa_clean}")
-
-
-        log(f"BEFORE BUILD DESC referral_drive_link={referral_drive_link}")
-
-
-        desc = (
-            f"WhatsApp Web:\nhttps://web.whatsapp.com/send?phone={whatsapp_number}\n\n"
-            f"WhatsApp Phone:\nhttps://wa.me/{whatsapp_number}\n\n"
-            f"SPRING - Issue:\n{spring_issue}\n\n"
-            f"CoSS Support Provided:\n{coss_support}\n\n"
-            f"Supporting Documents attached:\n{supporting_docs}\n\n"
-            f"'':{airtable_id}\n\n"
-            )
-
-        
-        retained_referral_link = ""
-
-        if airtable_id in existing_cards:
-
-            log(f"AIRTABLE ID = {airtable_id}")
-            log(f"FOUND IN EXISTING = {airtable_id in existing_cards}")
-
-            existing = existing_cards[airtable_id]
-            card = existing["card"]
-            card_id = card["id"]
-
-            log(f"🔄 Updating existing card: {card_name}")
-
-            if existing["closed"]:
-                trello_put(
-                    f"/cards/{card_id}",
-                    {"closed": "false"}
+                retained_referral_link = get_retained_referral_link(card_id)
+                updated += 1
+            else:
+                log(f"🆕 Creating new card: {card_name}")
+                card = trello_post(
+                    "/cards",
+                    {
+                        "idList": CREATE_LIST_ID,
+                        "name": card_name,
+                        "desc": "",
+                        "due": eviction_date.isoformat() if eviction_date else None,
+                        "pos": calculate_card_position(created_at)
+                    }
                 )
+                card_id = card["id"]
+                existing_cards[airtable_id] = {"card": card, "closed": False}
+                created += 1
 
-            log(f"EXISTING CARD COUNT = {len(existing_cards)}")
+                ensure_drive_status_label(card_id, gdrive)
 
-            # Save referral link BEFORE wiping description
-            retained_referral_link = get_retained_referral_link(card_id)
-            updated += 1
+                phone = clean_phone(whatsapp_phone or contact_phone)
+                if phone:
+                    for stored_phone, cards_list in phone_index.items():
+                        if not phone_matches(phone, stored_phone):
+                            continue
+                        for other_card in cards_list:
+                            other_id = other_card["id"]
+                            if other_id == card_id:
+                                continue
+                            card_details = trello_get(f"/cards/{other_id}", {"fields": "name,desc"})
+                            other_airtable_id = extract_airtable_id_from_card(card_details.get("desc", ""))
+                            if other_airtable_id:
+                                continue
 
+                            existing_drive = get_drive_link_from_card(other_id)
+                            if existing_drive:
+                                referral_drive_link = existing_drive
+                            mark_and_move_to_cleanup(other_card)
+                            break
 
-        else:
+            if not referral_drive_link:
+                referral_drive_link = retained_referral_link
 
-            log(f"🆕 Creating new card: {card_name}")
+            desc = (
+                f"WhatsApp Web:\nhttps://web.whatsapp.com/send?phone={whatsapp_number}\n\n"
+                f"WhatsApp Phone:\nhttps://wa.me/{whatsapp_number}\n\n"
+                f"SPRING - Issue:\n{spring_issue}\n\n"
+                f"CoSS Support Provided:\n{coss_support}\n\n"
+                f"Supporting Documents attached:\n{supporting_docs}\n\n"
+                f"AIRTABLE_RECORD_ID:\n{airtable_id}\n"
+            )
 
-            card = trello_post(
-                "/cards",
+            if referral_drive_link:
+                desc += f"\n\nREFERRAL_DOCUMENTS:\n{referral_drive_link}\n"
+
+            clean_card(card_id)
+            trello_put(
+                f"/cards/{card_id}",
                 {
-                    "idList": CREATE_LIST_ID,
                     "name": card_name,
-                    "desc": "",
+                    "desc": desc,
                     "due": eviction_date.isoformat() if eviction_date else None,
                     "pos": calculate_card_position(created_at)
                 }
             )
 
-            card_id = card["id"]
+            attachments = trello_get(f"/cards/{card_id}/attachments")
+            for att in attachments:
+                trello_delete(f"/cards/{card_id}/attachments/{att['id']}")
 
-            existing_cards[airtable_id] = {
-                "card": card,
-                "closed": False
-            }
-
-            created += 1
-
-            # Drive status is checked ONLY once, when the Trello card is
-            # initially created from the Airtable record. Existing cards are
-            # deliberately not rechecked during normal sync updates.
-            ensure_drive_status_label(
+            add_comment(
                 card_id,
-                gdrive
+                airtable_id,
+                last_modified,
+                coss_notes,
+                scc_notes,
+                cas_notes,
+                gdrive,
+                fullname
             )
 
-            # =========================================================
-            # ✅ DUPLICATE CHECK (MOVE THIS INTO YOUR MAIN LOOP)
-            # =========================================================
+            ensure_referral_label(card_id, referral_requested_date)
 
-            phone = clean_phone(
-                whatsapp_phone or contact_phone
-            )
+        except Exception as e:
+            log(f"❌ Error processing {airtable_id}: {e}", "error")
 
-
-            if phone:
-
-                for stored_phone, cards_list in phone_index.items():
-
-                    log(
-                        f"COMPARE CREATE | incoming={phone} "
-                        f"| stored={stored_phone} "
-                        f"| match={phone_matches(phone, stored_phone)}"
-                    )
+    log(f"\n✅ Complete. Cards created: {created}, updated: {updated}")
 
 
-                    if not phone_matches(phone, stored_phone):
-                        continue
-
-                    for other_card in cards_list:
-
-                        other_id = other_card["id"]
-
-                        if other_id == card_id:
-                            continue
-
-                        card_details = trello_get(
-                            f"/cards/{other_id}",
-                            {"fields": "name,desc"}
-                        )
-
-                        other_airtable_id = extract_airtable_id_from_card(
-                            card_details.get("desc", "")
-                        )
-
-                        if other_airtable_id:
-                            continue
-
-                        log(
-                            f"CARD={other_card['name']} "
-                            f"AIRTABLE_ID={other_airtable_id}"
-                        )
+async def main():
+    await run_oauth_mcp_session(execute_sync_pipeline)
 
 
-                        existing_drive = get_drive_link_from_card(other_id)
-
-                        log("================================")
-                        log(f"MATCH FOUND")
-                        log(f"PHONE={phone}")
-                        log(f"STORED={stored_phone}")
-                        log(f"CARD={other_card['name']}")
-                        log("================================")
-
-
-                        if existing_drive:
-
-                            referral_drive_link = existing_drive
-
-                            log(
-                                f"📁 Found duplicate drive link: "
-                                f"{referral_drive_link}"
-                            )
-
-                            log(f"AFTER DETECTION referral_drive_link={referral_drive_link}")
-
-
-                        mark_and_move_to_cleanup(other_card)
-                        break
-        # Keep Airtable Date of Birth in a Trello custom field only.
-        # It is intentionally not written into the card name, description, or comments.
-        if dob_custom_field_id:
-            try:
-                set_card_date_of_birth(
-                    card_id=card_id,
-                    custom_field_id=dob_custom_field_id,
-                    airtable_dob=date_of_birth,
-                )
-            except Exception as exc:
-                log(
-                    f"Could not update Date of Birth custom field for card {card_id}: {exc}",
-                    "error",
-                )
-
-        # If updating, use retained copy
-        if not referral_drive_link:
-            referral_drive_link = retained_referral_link
-
-        desc = (
-            f"WhatsApp Web:\n"
-            f"https://web.whatsapp.com/send?phone={whatsapp_number}\n\n"
-
-            f"WhatsApp Phone:\n"
-            f"https://wa.me/{whatsapp_number}\n\n"
-
-            f"SPRING - Issue:\n"
-            f"{spring_issue}\n\n"
-
-            f"CoSS Support Provided:\n"
-            f"{coss_support}\n\n"
-
-            f"Supporting Documents attached:\n"
-            f"{supporting_docs}\n\n"
-
-            f"AIRTABLE_RECORD_ID:\n"
-            f"{airtable_id}\n"
-        )
-
-        if referral_drive_link:
-
-            desc += (
-                "\n\n"
-                "REFERRAL_DOCUMENTS:\n"
-                f"{referral_drive_link}\n"
-            )
-
-        log("FINAL DESC:")
-        log(desc)
-
-        clean_card(card_id)
-
-        trello_put(
-            f"/cards/{card_id}",
-            {
-                "name": card_name,
-                "desc": desc,
-                "due": eviction_date.isoformat() if eviction_date else None,
-                "pos": calculate_card_position(created_at)
-            }
-        )
-
-
-
-        log(
-                f"ADDING REFERRAL LINK BACK TO DESC: "
-                f"{referral_drive_link}"
-            )
-
-    
-        # =========================================================
-        # Remove attachments
-        # =========================================================
-
-        attachments = trello_get(f"/cards/{card_id}/attachments")
-
-        for att in attachments:
-            trello_delete(f"/cards/{card_id}/attachments/{att['id']}")
-
-        
-        log(f"Client docs: {gdrive}")
-        log(f"Referral docs: {referral_drive_link}")
-        log(f"CLIENT DOCS = {gdrive}")
-        log(f"REFERRAL DOCS = {referral_drive_link}")
-
-
-        log(f"INSIDE add_comment() referral={referral_drive_link}")
-        log("====================================")
-        log(f"FINAL referral_drive_link = {referral_drive_link}")
-        log("====================================")
-
-        log("========= COMMENT INPUT =========")
-        log(f"gdrive={gdrive}")
-        log(f"referral_drive_link={referral_drive_link}")
-        log("================================")
-
-
-        
-
-        log(f"FINAL referral_drive_link = {referral_drive_link}")
-
-
-        
-        # ✅ Add secure Airtable link instead of raw notes
-        add_comment(
-            card_id,
-            airtable_id,
-            last_modified,
-            coss_notes,
-            scc_notes,
-            cas_notes,
-            gdrive,
-            fullname
-        )
-
-
-        log(
-            f"DEBUG: {fullname} | SCC referral date = {repr(referral_requested_date)}"
-        )
-
-        ensure_referral_label(
-            card_id,
-            referral_requested_date
-        )
-
-        for key in fields.keys():
-            if "SCC" in key:
-                log(f"SCC FIELD: {key} = {fields[key]}")
-
-
-
-        
-        log(f"PHONE INDEX: {phone_index.keys()}")
-
-
-
-    except Exception as e:
-        log(f"❌ Error processing {airtable_id}: {e}", "error")
-
-log(f"\n✅ Complete. Cards created: {created}, updated: {updated}")
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\nCancelled.")
+        sys.exit(130)
+    except Exception as exc:
+        import traceback
+        print("\n❌ DETAILED EXCEPTION TRACEBACK:")
+        traceback.print_exc()
+        log(f"Pipeline failed: {exc}", "error")
+        sys.exit(1)
