@@ -37,3 +37,6 @@ whatsapp_service.db-wal
 # WhatsApp debug/error screenshots
 whatsapp_debug_*.png
 whatsapp_error_*.png
+
+# Airtable 
+.airtable_tokens.json
