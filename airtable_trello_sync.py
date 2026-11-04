@@ -30,7 +30,11 @@ from pydantic import AnyUrl
 from mcp import ClientSession
 from mcp.client.auth import AuthorizationCodeResult, OAuthClientProvider
 from mcp.client.streamable_http import streamable_http_client
-from mcp.shared.auth import OAuthClientMetadata, OAuthToken
+from mcp.shared.auth import (
+    OAuthClientInformationFull,
+    OAuthClientMetadata,
+    OAuthToken,
+)
 
 # =========================================================
 # CONFIG
@@ -155,41 +159,138 @@ def log(msg, level="info"):
 # =========================================================
 
 class PersistentTokenStorage:
+    """Persist MCP OAuth tokens and client registration between processes."""
+
     def __init__(self, token_path: Path):
         self.token_path = token_path
 
-    async def get_tokens(self) -> OAuthToken | None:
+    def _load_data(self):
         if not self.token_path.exists():
-            return None
+            return {}
+
         try:
-            data = json.loads(self.token_path.read_text(encoding="utf-8"))
+            data = json.loads(
+                self.token_path.read_text(encoding="utf-8")
+            )
+
+            if isinstance(data, dict):
+                return data
+
+        except Exception as e:
+            log(f"Could not load OAuth storage: {e}", "warning")
+
+        return {}
+
+    def _save_data(self, data):
+        try:
+            self.token_path.parent.mkdir(
+                parents=True,
+                exist_ok=True,
+            )
+
+            # Write atomically so a process interruption cannot leave
+            # the OAuth file half-written.
+            temp_path = self.token_path.with_suffix(
+                self.token_path.suffix + ".tmp"
+            )
+
+            temp_path.write_text(
+                json.dumps(
+                    data,
+                    indent=2,
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            temp_path.chmod(0o600)
+            temp_path.replace(self.token_path)
+
+            # Make sure the final file remains private.
+            self.token_path.chmod(0o600)
+
+        except Exception as e:
+            log(
+                f"Could not save OAuth storage to disk: {e}",
+                "error",
+            )
+
+    async def get_tokens(self) -> OAuthToken | None:
+        data = self._load_data()
+        token_data = data.get("tokens")
+
+        # Backward compatibility with your existing file format,
+        # where token fields were stored at the top level.
+        if not isinstance(token_data, dict):
+            if "access_token" not in data:
+                return None
+            token_data = data
+
+        try:
             return OAuthToken(
-                access_token=data.get("access_token"),
-                refresh_token=data.get("refresh_token"),
-                token_type=data.get("token_type", "Bearer"),
-                expires_in=data.get("expires_in"),
+                access_token=token_data.get("access_token"),
+                refresh_token=token_data.get("refresh_token"),
+                token_type=token_data.get("token_type", "Bearer"),
+                expires_in=token_data.get("expires_in"),
+                scope=token_data.get("scope"),
             )
         except Exception as e:
-            log(f"Could not load saved tokens: {e}", "warning")
+            log(
+                f"Could not load saved Airtable OAuth tokens: {e}",
+                "warning",
+            )
             return None
 
     async def set_tokens(self, tokens: OAuthToken) -> None:
-        try:
-            data = {
-                "access_token": tokens.access_token,
-                "refresh_token": tokens.refresh_token,
-                "token_type": tokens.token_type,
-                "expires_in": tokens.expires_in,
-            }
-            self.token_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
-        except Exception as e:
-            log(f"Could not save tokens to disk: {e}", "error")
+        data = self._load_data()
+
+        data["tokens"] = {
+            "access_token": tokens.access_token,
+            "refresh_token": tokens.refresh_token,
+            "token_type": tokens.token_type,
+            "expires_in": tokens.expires_in,
+            "scope": getattr(tokens, "scope", None),
+        }
+
+        self._save_data(data)
 
     async def get_client_info(self):
-        return None
+        data = self._load_data()
+        client_data = data.get("client_info")
+
+        if not isinstance(client_data, dict):
+            return None
+
+        try:
+            return OAuthClientInformationFull.model_validate(
+                client_data
+            )
+        except Exception as e:
+            log(
+                f"Could not load saved Airtable OAuth client information: {e}",
+                "warning",
+            )
+            return None
 
     async def set_client_info(self, client_info):
-        pass
+        data = self._load_data()
+
+        try:
+            if hasattr(client_info, "model_dump"):
+                client_data = client_info.model_dump(mode="json")
+            elif hasattr(client_info, "dict"):
+                client_data = client_info.dict()
+            else:
+                client_data = dict(client_info)
+
+            data["client_info"] = client_data
+            self._save_data(data)
+
+        except Exception as e:
+            log(
+                f"Could not save Airtable OAuth client information: {e}",
+                "error",
+            )
 
 
 class CallbackCapture:
