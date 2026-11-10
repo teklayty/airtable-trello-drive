@@ -33,6 +33,7 @@ from mcp.client.streamable_http import streamable_http_client
 from mcp.shared.auth import (
     OAuthClientInformationFull,
     OAuthClientMetadata,
+    OAuthMetadata,
     OAuthToken,
 )
 
@@ -45,7 +46,6 @@ TRELLO_API_TOKEN = os.getenv("TRELLO_API_TOKEN")
 
 CREATE_LIST_ID = os.getenv("TRELLO_CREATE_LIST_ID")
 EXISTING_LIST_IDS = os.getenv("TRELLO_EXISTING_LIST_IDS", "")
-RAW_ALLOWED_STAFF_IDS = os.getenv("TRELLO_ALLOWED_STAFF_IDS", "")
 
 AIRTABLE_MCP_URL = os.getenv("AIRTABLE_MCP_URL", "https://mcp.airtable.com/mcp")
 AIRTABLE_BASE_ID = os.getenv("AIRTABLE_BASE_ID", "appt4PI9krGalheLk")
@@ -93,15 +93,6 @@ DRIVE_FOLDER_EMPTY_LABEL = "Drive Folder Empty"
 RECENT_ARCHIVE_DAYS = 10
 
 AIRTABLE_RECORD_ID_RE = re.compile(r"rec[a-zA-Z0-9]{14}", re.IGNORECASE)
-# Staff filtering is record-ID-only; names never permit a client through.
-ALLOWED_STAFF = set()  # retained only for compatibility with unused diagnostics
-# Accept Airtable record IDs regardless of whether the environment variable
-# uses commas, spaces, newlines, or quotes as separators. Names are never
-# accepted because only the exact Airtable `rec...` ID pattern is extracted.
-ALLOWED_STAFF_IDS = {
-    match.casefold()
-    for match in AIRTABLE_RECORD_ID_RE.findall(RAW_ALLOWED_STAFF_IDS)
-}
 COSS_SUPPORT_PROVIDED_FIELD_ID = "fldIae0zVo5CMLfOj"
 COSS_NOTES_FIELD_ID = "fld9T6W0FyxyMw4E8"
 STAFF_ID_FILTER_FIELD_ID = "fldIOi1f33xWKzIJC"
@@ -227,13 +218,18 @@ class PersistentTokenStorage:
             token_data = data
 
         try:
-            return OAuthToken(
+            tokens = OAuthToken(
                 access_token=token_data.get("access_token"),
                 refresh_token=token_data.get("refresh_token"),
                 token_type=token_data.get("token_type", "Bearer"),
                 expires_in=token_data.get("expires_in"),
                 scope=token_data.get("scope"),
             )
+
+            # Restore the absolute expiry timestamp saved by this application.
+            # Older token files do not have expires_at; those tokens are treated
+            # as expired/unknown so the MCP provider can use the refresh token.
+            return tokens
         except Exception as e:
             log(
                 f"Could not load saved Airtable OAuth tokens: {e}",
@@ -244,11 +240,16 @@ class PersistentTokenStorage:
     async def set_tokens(self, tokens: OAuthToken) -> None:
         data = self._load_data()
 
+        expires_at = None
+        if tokens.expires_in is not None:
+            expires_at = time.time() + int(tokens.expires_in)
+
         data["tokens"] = {
             "access_token": tokens.access_token,
             "refresh_token": tokens.refresh_token,
             "token_type": tokens.token_type,
             "expires_in": tokens.expires_in,
+            "expires_at": expires_at,
             "scope": getattr(tokens, "scope", None),
         }
 
@@ -305,6 +306,147 @@ class CallbackCapture:
         self.callback_url = input("\nPaste the FULL localhost:3030/callback URL here: ").strip()
 
 
+class DiagnosticOAuthClientProvider(OAuthClientProvider):
+    """Temporary diagnostic wrapper around MCP OAuth.
+
+    Logs the actual HTTP request/response pairs used by the OAuth flow.
+    Authorization headers and request bodies are deliberately not logged.
+    """
+
+    async def _initialize(self):
+        await super()._initialize()
+
+        # PersistentTokenStorage saves the absolute expiry timestamp in the
+        # JSON file, but the MCP OAuthContext does not know about that field.
+        # Restore it here so normal MCP refresh logic can operate correctly.
+        data = self.context.storage._load_data()
+        token_data = data.get("tokens") if isinstance(data, dict) else None
+
+        if self.context.current_tokens:
+            expires_at = (
+                token_data.get("expires_at")
+                if isinstance(token_data, dict)
+                else None
+            )
+
+            if expires_at is not None:
+                self.context.token_expiry_time = float(expires_at)
+            else:
+                # Legacy token file: expiry is unknown. Force the normal
+                # refresh-token path without deleting the refresh token.
+                self.context.token_expiry_time = -1
+
+        # IMPORTANT:
+        # The MCP library attempts token refresh before it performs OAuth
+        # metadata discovery. For Airtable, that makes its fallback refresh
+        # URL become https://mcp.airtable.com/token, which is incorrect.
+        #
+        # Discover Airtable's authorization-server metadata here first so
+        # _refresh_token() can use the advertised token_endpoint.
+        if self.context.oauth_metadata is None:
+            metadata_url = (
+                "https://airtable.com/.well-known/"
+                "oauth-authorization-server/oauth2/v1"
+            )
+
+            print(
+                "\n[OAUTH DEBUG] Discovering Airtable OAuth metadata"
+                f"\n  GET {metadata_url}"
+            )
+
+            async with httpx2.AsyncClient(timeout=30) as metadata_client:
+                response = await metadata_client.get(metadata_url)
+
+            print(
+                "[OAUTH DEBUG] Airtable OAuth metadata response"
+                f"\n  status: {response.status_code}"
+            )
+
+            response.raise_for_status()
+
+            metadata = OAuthMetadata.model_validate_json(
+                response.content
+            )
+
+            self.context.oauth_metadata = metadata
+
+            print(
+                "[OAUTH DEBUG] Airtable OAuth metadata loaded"
+                f"\n  issuer: {metadata.issuer}"
+                f"\n  authorization_endpoint: "
+                f"{metadata.authorization_endpoint}"
+                f"\n  token_endpoint: {metadata.token_endpoint}"
+            )
+
+    async def _auth_flow(self, request):
+        flow = super()._auth_flow(request)
+
+        try:
+            outgoing = await flow.__anext__()
+
+            while True:
+                print(
+                    "\n[OAUTH DEBUG] HTTP request"
+                    f"\n  {outgoing.method} {outgoing.url}"
+                )
+
+                response = yield outgoing
+
+                try:
+                    status = response.status_code
+                    www_auth = response.headers.get("WWW-Authenticate")
+                    location = response.headers.get("Location")
+
+                    print(
+                        "[OAUTH DEBUG] HTTP response"
+                        f"\n  {outgoing.method} {outgoing.url}"
+                        f"\n  status: {status}"
+                        f"\n  WWW-Authenticate: {www_auth!r}"
+                        f"\n  Location: {location!r}"
+                    )
+
+                    if status in (400, 401, 403):
+                        print(
+                            "  *** OAUTH-RELEVANT RESPONSE DETECTED ***"
+                        )
+
+                except Exception as exc:
+                    print(
+                        f"[OAUTH DEBUG] Could not inspect response: {exc}"
+                    )
+
+                if outgoing is not request:
+                    # Mirror RedirectAwareAuth behaviour for redirects.
+                    from mcp.shared._httpx_utils import next_request_within_origin
+
+                    for _ in range(10):
+                        follow = next_request_within_origin(response)
+
+                        if follow is None:
+                            break
+
+                        print(
+                            "\n[OAUTH DEBUG] Following redirect:"
+                            f"\n  {follow.method} {follow.url}"
+                        )
+
+                        outgoing = follow
+                        response = yield outgoing
+
+                        print(
+                            "[OAUTH DEBUG] Redirect response"
+                            f"\n  {outgoing.method} {outgoing.url}"
+                            f"\n  status: {response.status_code}"
+                        )
+
+                outgoing = await flow.asend(response)
+
+        except StopAsyncIteration:
+            return
+        finally:
+            await flow.aclose()
+
+
 async def run_oauth_mcp_session(work_callback):
     callback = CallbackCapture()
 
@@ -325,7 +467,7 @@ async def run_oauth_mcp_session(work_callback):
             raise RuntimeError("OAuth callback URL did not contain a code.")
         return AuthorizationCodeResult(code=code, state=state, iss=iss)
 
-    provider = OAuthClientProvider(
+    provider = DiagnosticOAuthClientProvider(
         server_url=AIRTABLE_MCP_URL,
         client_metadata=OAuthClientMetadata(
             client_name="Airtable Trello Interface Sync",
@@ -969,19 +1111,12 @@ async def diagnose_case_study_relationship(session, client_record_id):
 
         log(f"Case studies records returned: {len(records)}")
 
-        allowed = {
-            re.sub(r"\s+", " ", value.strip().lower())
-            for value in ALLOWED_STAFF
-            if value.strip()
-        }
-
         scanned = 0
         link_field_present = 0
         staff_field_present = 0
         linked_ids_found = 0
         target_link_count = 0
         target_with_staff = 0
-        target_allowed_staff = 0
         missing_details = 0
         link_shapes = {}
 
@@ -1054,16 +1189,6 @@ async def diagnose_case_study_relationship(session, client_record_id):
                     if cells.get(staff_field_id) not in (None, "", []):
                         target_with_staff += 1
 
-                    staff_value = re.sub(
-                        r"\s+",
-                        " ",
-                        diagnostic_text(cells.get(staff_field_id)).lower(),
-                    )
-
-                    if staff_value and any(
-                        name in staff_value for name in allowed
-                    ):
-                        target_allowed_staff += 1
 
             if staff_field_id in cells:
                 staff_field_present += 1
@@ -1076,9 +1201,8 @@ async def diagnose_case_study_relationship(session, client_record_id):
             f"linked record IDs found={linked_ids_found}; "
             f"selected client linked={target_link_count}; "
             f"selected client links with staff={target_with_staff}; "
-            f"selected client links matching allowlist={target_allowed_staff}; "
             f"detail failures={missing_details}; "
-            f"allowlist entries={len(allowed)}."
+            f"detail failures={missing_details}."
         )
         log(f"Client-link value types: {link_shapes}")
 
@@ -1483,10 +1607,49 @@ def _staff_diag_normalize(value):
     """Normalise whitespace and case for exact name matching."""
     return " ".join(str(value).casefold().split())
 
+async def get_record_for_page_safe(session, arguments):
+    """Get an Interface record without treating page-specific absence as fatal.
+
+    A record returned by one Interface page is not necessarily present on every
+    other Interface page that exposes the same field. Airtable reports that
+    situation as a normal MCP error: "Record not found at the given path."
+    """
+    result = await session.call_tool("get_record_for_page", arguments)
+
+    is_error = getattr(result, "is_error", None)
+    if is_error is None:
+        is_error = getattr(result, "isError", False)
+
+    if not is_error:
+        structured = getattr(result, "structured_content", None)
+        if structured is None:
+            structured = getattr(result, "structuredContent", None)
+        return _to_plain_json(structured), False
+
+    error_messages = []
+    for item in getattr(result, "content", []) or []:
+        text = getattr(item, "text", None)
+        if text:
+            error_messages.append(str(text))
+
+    error_text = " | ".join(error_messages)
+
+    if "Record not found at the given path" in error_text:
+        return None, True
+
+    log(
+        "MCP get_record_for_page failed: "
+        + (error_text or "unknown MCP error"),
+        "error",
+    )
+    return None, False
+
+
+
 async def airtable_mcp_get_all_records(session, limit=2000):
     """Fetch the client list, then enrich each record with its Interface detail fields.
 
-    The CoSS Support Provided lookup is the sole staff-ID filtering source. Only the last AIRTABLE_RECORD_WINDOW records in the returned Interface
+    Only the last AIRTABLE_RECORD_WINDOW records in the returned Interface
     order are enriched (default 50). Requests are serialised and rate-limited.
     No Trello calls happen in this function.
     """
@@ -1542,10 +1705,6 @@ async def airtable_mcp_get_all_records(session, limit=2000):
         f"{AIRTABLE_TABLE_ID}."
     )
     log(
-        f"Staff eligibility uses only linkedRecordIds from Organisation completing IA "
-        f"(field {STAFF_ID_FILTER_FIELD_ID}); lookup display values are ignored."
-    )
-    log(
         f"Processing last {len(valid_records)} valid records in returned Interface order: "
         f"positions {first_position}-{last_position} of {len(valid_records_all)}; "
         "only these records will receive detail requests."
@@ -1576,9 +1735,8 @@ async def airtable_mcp_get_all_records(session, limit=2000):
         detail_cells = {}
 
         try:
-            detail = await call_mcp_structured(
+            detail, primary_page_not_found = await get_record_for_page_safe(
                 session,
-                "get_record_for_page",
                 {
                     "baseId": AIRTABLE_BASE_ID,
                     "interfaceId": AIRTABLE_INTERFACE_ID,
@@ -1611,9 +1769,8 @@ async def airtable_mcp_get_all_records(session, limit=2000):
                     if not source_page_id or source_page_id == AIRTABLE_PAGE_ID:
                         continue
 
-                    source_detail = await call_mcp_structured(
+                    source_detail, source_page_not_found = await get_record_for_page_safe(
                         session,
-                        "get_record_for_page",
                         {
                             "baseId": AIRTABLE_BASE_ID,
                             "interfaceId": source_page.get("interface_id") or AIRTABLE_INTERFACE_ID,
@@ -1694,6 +1851,7 @@ async def airtable_mcp_get_all_records(session, limit=2000):
         f"detail failures={detail_failures}; "
         f"detail responses containing {COSS_SUPPORT_PROVIDED_FIELD_ID}={staff_field_detail_matches}."
     )
+
     return formatted_records
 
 # =========================================================
@@ -1981,123 +2139,6 @@ def has_scc_referral(fields):
 COSS_SUPPORT_PROVIDED_FIELD_ID = "fldIae0zVo5CMLfOj"
 
 
-def extract_staff_ids_from_organisation_lookup(fields):
-    """Extract staff record IDs from the lookup's linkedRecordIds only.
-
-    The organisation display values and valuesByLinkedRecordId values
-    are deliberately ignored.
-    """
-    if not isinstance(fields, dict):
-        return set()
-
-    value = fields.get(STAFF_ID_FILTER_FIELD_ID)
-
-    if value is None:
-        value = fields.get("Organisation completing IA")
-
-    if isinstance(value, str):
-        try:
-            decoded = json.loads(value)
-        except (TypeError, ValueError):
-            decoded = None
-
-        if isinstance(decoded, (dict, list)):
-            value = decoded
-        elif AIRTABLE_RECORD_ID_RE.fullmatch(value.strip()):
-            value = {"linkedRecordIds": [value.strip()]}
-        else:
-            return set()
-
-    if isinstance(value, dict):
-        linked_ids = value.get("linkedRecordIds", [])
-    elif isinstance(value, list):
-        linked_ids = value
-    else:
-        return set()
-
-    if not isinstance(linked_ids, list):
-        return set()
-
-    return {
-        item.strip().casefold()
-        for item in linked_ids
-        if isinstance(item, str)
-        and AIRTABLE_RECORD_ID_RE.fullmatch(item.strip())
-    }
-
-
-
-
-def extract_approved_organisation_ids(fields):
-    """Read only linkedRecordIds from Organisation completing IA."""
-
-    if not isinstance(fields, dict):
-        return set()
-
-    value = fields.get(STAFF_ID_FILTER_FIELD_ID)
-
-    if value is None:
-        value = fields.get("Organisation completing IA")
-
-    if isinstance(value, str):
-        try:
-            decoded = json.loads(value)
-        except (TypeError, ValueError):
-            decoded = None
-
-        if isinstance(decoded, (dict, list)):
-            value = decoded
-        elif AIRTABLE_RECORD_ID_RE.fullmatch(value.strip()):
-            value = {"linkedRecordIds": [value.strip()]}
-        else:
-            return set()
-
-    if isinstance(value, dict):
-        linked_ids = value.get("linkedRecordIds", [])
-    elif isinstance(value, list):
-        linked_ids = value
-    else:
-        return set()
-
-    if not isinstance(linked_ids, list):
-        return set()
-
-    return {
-        item.strip().casefold()
-        for item in linked_ids
-        if isinstance(item, str)
-        and AIRTABLE_RECORD_ID_RE.fullmatch(item.strip())
-    }
-
-
-def record_has_approved_organisation_link(fields):
-    """Eligible when an Organisation lookup linked ID matches the allowlist."""
-
-    if not ALLOWED_STAFF_IDS:
-        return False
-
-    linked_ids = extract_approved_organisation_ids(fields)
-    return bool(linked_ids.intersection(ALLOWED_STAFF_IDS))
-
-
-def verify_staff_allowed(fields, allowed_staff_set=None, allowed_staff_ids=None):
-    """Compatibility wrapper for the existing sync filtering calls."""
-
-    if allowed_staff_ids is None:
-        allowed_staff_ids = ALLOWED_STAFF_IDS
-
-    if not isinstance(fields, dict) or not allowed_staff_ids:
-        return False
-
-    linked_ids = extract_approved_organisation_ids(fields)
-
-    valid_allowed_ids = {
-        str(item).strip().casefold()
-        for item in allowed_staff_ids
-        if AIRTABLE_RECORD_ID_RE.fullmatch(str(item).strip())
-    }
-
-    return bool(linked_ids.intersection(valid_allowed_ids))
 
 
 def build_notes_link(record_id):
@@ -3323,269 +3364,9 @@ async def execute_sync_pipeline(session):
 
 
     # =========================================================
-    # NONAPPROVED ORGANISATION RECORD ID DISCOVERY
-    # EXACT SAME RULE AS THE 43/50 ELIGIBILITY SCAN:
-    # linked IDs from Organisation completing IA intersect the
-    # configured approved Airtable organisation IDs.
-    # =========================================================
-    nonapproved_record_ids = []
-    approved_record_ids = []
-
-    for record in records:
-        if not isinstance(record, dict):
-            continue
-
-        fields = record.get("fields", {})
-
-        if not isinstance(fields, dict):
-            continue
-
-        value = fields.get("fldIOi1f33xWKzIJC")
-
-        if isinstance(value, str):
-            try:
-                value = json.loads(value)
-            except (TypeError, ValueError):
-                pass
-
-        try:
-            serialised = json.dumps(
-                value,
-                ensure_ascii=False,
-                default=str,
-            )
-        except Exception:
-            serialised = str(value)
-
-        linked_ids = {
-            match.casefold()
-            for match in AIRTABLE_RECORD_ID_RE.findall(serialised)
-        }
-
-        approved = bool(
-            linked_ids.intersection(ALLOWED_STAFF_IDS)
-        )
-
-        record_id = record.get("id")
-
-        if not record_id:
-            continue
-
-        if approved:
-            approved_record_ids.append(record_id)
-        else:
-            nonapproved_record_ids.append(record_id)
-
-    log(
-        f"EXACT ORGANISATION FILTER CHECK: "
-        f"approved={len(approved_record_ids)}/{len(records)}; "
-        f"nonapproved={len(nonapproved_record_ids)}/{len(records)}."
-    )
-
-    for index, record_id in enumerate(nonapproved_record_ids, start=1):
-        log(
-            f"NONAPPROVED ORGANISATION RECORD {index}: {record_id}"
-        )
-
-    # =========================================================
-    nonapproved_record_ids = []
-
-    for record in records:
-        if not isinstance(record, dict):
-            continue
-
-        fields = record.get("fields", {})
-
-        if not isinstance(fields, dict):
-            continue
-
-        approved = verify_staff_allowed(
-            fields,
-            set(),
-            ALLOWED_STAFF_IDS,
-        )
-
-        if not approved:
-            record_id = record.get("id")
-
-            if record_id:
-                nonapproved_record_ids.append(record_id)
-
-    log(
-        f"NONAPPROVED STAFF RECORD ID DISCOVERY: "
-        f"{len(nonapproved_record_ids)} records failed the approved "
-        f"Organisation completing IA filter."
-    )
-
-    for index, record_id in enumerate(nonapproved_record_ids, start=1):
-        log(
-            f"NONAPPROVED RECORD {index}: {record_id}"
-        )
-
-
-    # =========================================================
     # COSS CLIENT FIELD POPULATION DIAGNOSTIC
 
     # =========================================================
-    # =========================================================
-    # APPROVED + COSS OVERLAP DIAGNOSTIC
-    # Uses the same Organisation-completing-IA logic as the
-    # real eligibility filter.
-    # =========================================================
-    log("APPROVED + COSS OVERLAP DIAGNOSTIC:")
-
-    approved_count = 0
-    approved_and_coss = 0
-    approved_without_coss = 0
-    nonapproved_and_coss = 0
-    nonapproved_without_coss = 0
-
-    coss_fields_for_overlap = {
-        "fldK2muwDjOv0swUz",   # CoSS Grouping
-        "fld9T6W0FyxyMw4E8",   # CoSS Notes
-        "fldIae0zVo5CMLfOj",   # CoSS Support Provided
-        "fldTWFlUNRO46IX4O",   # CoSS Support Provided (2026)
-    }
-
-    for record in records:
-        fields = record.get("fields", {})
-
-        if not isinstance(fields, dict):
-            continue
-
-        # IMPORTANT:
-        # Reuse the same tested Organisation completing IA
-        # eligibility function as the real pipeline.
-        approved = verify_staff_allowed(
-            fields,
-            set(),
-            ALLOWED_STAFF_IDS,
-        )
-
-        coss = False
-
-        for field_id in coss_fields_for_overlap:
-            value = fields.get(field_id)
-
-            if value in (None, "", [], {}, False):
-                continue
-
-            text = str(value).strip()
-
-            if text and text.casefold() not in {
-                "none",
-                "null",
-                "[]",
-                "{}",
-            }:
-                coss = True
-                break
-
-        if approved:
-            approved_count += 1
-
-            if coss:
-                approved_and_coss += 1
-            else:
-                approved_without_coss += 1
-        else:
-            if coss:
-                nonapproved_and_coss += 1
-            else:
-                nonapproved_without_coss += 1
-
-    log(
-        f"Approved organisation clients={approved_count}; "
-        f"approved + CoSS={approved_and_coss}; "
-        f"approved without CoSS={approved_without_coss}; "
-        f"nonapproved + CoSS={nonapproved_and_coss}; "
-        f"nonapproved without CoSS={nonapproved_without_coss}."
-    )
-
-    # =========================================================
-    log("APPROVED + COSS OVERLAP DIAGNOSTIC:")
-
-    approved_count = 0
-
-    coss_fields_for_overlap = {
-        "fldK2muwDjOv0swUz",   # CoSS Grouping
-        "fld9T6W0FyxyMw4E8",   # CoSS Notes
-        "fldIae0zVo5CMLfOj",   # CoSS Support Provided
-        "fldTWFlUNRO46IX4O",   # CoSS Support Provided (2026)
-    }
-
-    approved_and_coss = 0
-    approved_without_coss = 0
-    nonapproved_and_coss = 0
-    nonapproved_without_coss = 0
-
-    for record in records:
-        fields = record.get("fields", {})
-
-        if not isinstance(fields, dict):
-            continue
-
-        organisation_value = fields.get("fldIOi1f33xWKzIJC")
-
-        if isinstance(organisation_value, str):
-            try:
-                organisation_value = json.loads(organisation_value)
-            except (TypeError, ValueError):
-                organisation_value = None
-
-        serialised_org = json.dumps(
-            organisation_value,
-            ensure_ascii=False,
-            default=str,
-        )
-
-        organisation_ids = {
-            match.casefold()
-            for match in AIRTABLE_RECORD_ID_RE.findall(serialised_org)
-        }
-
-        approved = bool(
-            organisation_ids.intersection(ALLOWED_STAFF_IDS)
-        )
-
-        coss = False
-
-        for field_id in coss_fields_for_overlap:
-            value = fields.get(field_id)
-
-            if value not in (None, "", [], {}, False):
-                text = str(value).strip()
-
-                if text and text.lower() not in {
-                    "none",
-                    "null",
-                    "[]",
-                    "{}",
-                }:
-                    coss = True
-                    break
-
-        if approved:
-            approved_count += 1
-
-            if coss:
-                approved_and_coss += 1
-            else:
-                approved_without_coss += 1
-        else:
-            if coss:
-                nonapproved_and_coss += 1
-            else:
-                nonapproved_without_coss += 1
-
-    log(
-        f"Approved organisation clients={approved_count}; "
-        f"approved + CoSS={approved_and_coss}; "
-        f"approved without CoSS={approved_without_coss}; "
-        f"nonapproved + CoSS={nonapproved_and_coss}; "
-        f"nonapproved without CoSS={nonapproved_without_coss}."
-    )
-
     # Counts only; never prints client values or record IDs.
     # =========================================================
     log("COSS CLIENT FIELD POPULATION DIAGNOSTIC:")
@@ -3661,130 +3442,6 @@ async def execute_sync_pipeline(session):
     )
 
     await log_interface_field_labels(session)
-    # DIAGNOSTIC: find which client fields contain approved staff record IDs.
-    # Values and actual record IDs are never printed.
-    approved_id_matches_by_field = {}
-    unique_approved_ids_by_field = {}
-
-    for record in records:
-        fields = record.get("fields", {})
-
-        if not isinstance(fields, dict):
-            continue
-
-        for field_id, value in fields.items():
-            try:
-                serialised = json.dumps(
-                    value,
-                    ensure_ascii=False,
-                    default=str,
-                )
-            except Exception:
-                serialised = str(value)
-
-            found_ids = {
-                match.casefold()
-                for match in AIRTABLE_RECORD_ID_RE.findall(serialised)
-            }
-
-            matched_ids = found_ids.intersection(ALLOWED_STAFF_IDS)
-
-            if matched_ids:
-                approved_id_matches_by_field[field_id] = (
-                    approved_id_matches_by_field.get(field_id, 0) + 1
-                )
-
-                unique_approved_ids_by_field.setdefault(
-                    field_id, set()
-                ).update(matched_ids)
-    # Compare exact linked IDs with lookup-map keys.
-    # Do not use other IDs or names as staff identifiers.
-    org_direct_clients = 0
-    org_map_key_clients = 0
-    org_direct_ids = set()
-    org_map_key_ids = set()
-
-    for record in records:
-        fields = record.get("fields", {})
-        if not isinstance(fields, dict):
-            continue
-
-        value = fields.get("fldIOi1f33xWKzIJC")
-
-        if isinstance(value, str):
-            try:
-                value = json.loads(value)
-            except (TypeError, ValueError):
-                value = None
-
-        if not isinstance(value, dict):
-            continue
-
-        linked = value.get("linkedRecordIds", [])
-        mapped = value.get("valuesByLinkedRecordId", {})
-
-        direct_ids = {
-            item.strip().casefold()
-            for item in linked
-            if isinstance(item, str)
-            and AIRTABLE_RECORD_ID_RE.fullmatch(item.strip())
-        } if isinstance(linked, list) else set()
-
-        mapped_ids = {
-            key.strip().casefold()
-            for key in mapped
-            if isinstance(key, str)
-            and AIRTABLE_RECORD_ID_RE.fullmatch(key.strip())
-        } if isinstance(mapped, dict) else set()
-
-        direct_matches = direct_ids.intersection(ALLOWED_STAFF_IDS)
-        mapped_matches = mapped_ids.intersection(ALLOWED_STAFF_IDS)
-
-        if direct_matches:
-            org_direct_clients += 1
-            org_direct_ids.update(direct_matches)
-
-        if mapped_matches:
-            org_map_key_clients += 1
-            org_map_key_ids.update(mapped_matches)
-
-    log(
-        "ORGANISATION LOOKUP EXACT-ID TEST: "
-        f"clients matching linkedRecordIds={org_direct_clients}/50; "
-        f"distinct approved IDs in linkedRecordIds={len(org_direct_ids)}/16; "
-        f"clients matching valuesByLinkedRecordId keys={org_map_key_clients}/50; "
-        f"distinct approved IDs in lookup keys={len(org_map_key_ids)}/16."
-    )
-
-    log("THE 14 MATCHED APPROVED STAFF RECORD IDs:")
-
-    for index, staff_id in enumerate(sorted(org_direct_ids), start=1):
-        log(f"{index:02d}. {staff_id}")
-    log("APPROVED STAFF ID FIELD DISCOVERY:")
-
-    for field_id, client_count in sorted(
-        approved_id_matches_by_field.items(),
-        key=lambda item: -item[1],
-    ):
-        log(
-            f"Candidate field: {field_id} | "
-            f"clients with approved staff IDs={client_count}/"
-            f"{before_filter} | "
-            f"distinct approved IDs found="
-            f"{len(unique_approved_ids_by_field[field_id])}"
-        )
-
-    if approved_id_matches_by_field:
-        await diagnose_client_field_metadata(
-            session,
-            approved_id_matches_by_field.keys(),
-        )
-    else:
-        log(
-            "No approved staff IDs found in the returned client field maps. "
-            "Creator metadata may be outside cellValuesByFieldId."
-        )
-
     # =========================================================
     # REFERRAL FIELD ELIGIBILITY CSV DIAGNOSTIC
     # FETCH-ONLY: no Trello operations.
@@ -3827,10 +3484,6 @@ async def execute_sync_pipeline(session):
 
         field_counts = {name: 0 for name in referral_fields}
         referral_total = 0
-        approved_total = 0
-        both_total = 0
-        referral_only_total = 0
-        approved_only_total = 0
 
         output_path = Path(
             "/tmp/airtable_referral_field_diagnostic_last50.csv"
@@ -3838,7 +3491,6 @@ async def execute_sync_pipeline(session):
 
         columns = [
             "Airtable_Record_ID",
-            "Approved_Organisation_ID",
             "SCC_Referral",
             "SCC_Referral_Display_Value",
             "SCC_Referral_Data_Shape",
@@ -3868,11 +3520,6 @@ async def execute_sync_pipeline(session):
                 if not isinstance(fields, dict):
                     fields = {}
 
-                linked_ids = extract_approved_organisation_ids(fields)
-                approved = bool(
-                    linked_ids.intersection(ALLOWED_STAFF_IDS)
-                )
-
                 populated = {}
 
                 for name, field_id in referral_fields.items():
@@ -3889,24 +3536,13 @@ async def execute_sync_pipeline(session):
                     if present
                 ]
 
-                if approved:
-                    approved_total += 1
-
                 if has_referral:
                     referral_total += 1
-
-                if approved and has_referral:
-                    both_total += 1
-                elif has_referral:
-                    referral_only_total += 1
-                elif approved:
-                    approved_only_total += 1
 
                 scc_raw_value = fields.get(referral_fields["SCC"])
 
                 row = {
                     "Airtable_Record_ID": record.get("id", ""),
-                    "Approved_Organisation_ID": "YES" if approved else "NO",
                     "SCC_Referral": "YES" if populated["SCC"] else "NO",
                     "SCC_Referral_Display_Value": get_field(
                         fields, "SCC - Referral MAX^"
@@ -3942,71 +3578,27 @@ async def execute_sync_pipeline(session):
             log(f"REFERRAL FIELD {name}: populated={count}/{len(records)}")
 
         log(
-            f"REFERRAL SUMMARY: any referral={referral_total}; "
-            f"approved organisation={approved_total}; "
-            f"both={both_total}; "
-            f"referral only={referral_only_total}; "
-            f"approved only={approved_only_total}."
+            f"REFERRAL SUMMARY: any partner referral={referral_total}."
         )
 
         log(f"CSV created: {output_path}")
 
-    organisation_field_present = 0
-    clients_with_linked_ids = 0
-    eligible_count = 0
-    eligible_with_drive = 0
-    eligible_without_drive = 0
-    nonapproved_record_ids = []
+        # =========================================================
+        # SCC-ONLY ELIGIBILITY
+        # =========================================================
+        scc_populated_count = sum(
+            1
+            for record in records
+            if isinstance(record, dict)
+            and get_field(record.get("fields", {}), "SCC - Referral MAX^")
+        )
 
-    for record in records:
-        fields = record.get("fields", {}) if isinstance(record, dict) else {}
-        if not isinstance(fields, dict):
-            continue
-
-        if (
-            STAFF_ID_FILTER_FIELD_ID in fields
-            or "Organisation completing IA" in fields
-        ):
-            organisation_field_present += 1
-
-        linked_ids = extract_approved_organisation_ids(fields)
-
-        if linked_ids:
-            clients_with_linked_ids += 1
-
-        if linked_ids.intersection(ALLOWED_STAFF_IDS):
-            eligible_count += 1
-            if get_field(fields, "Link"):
-                eligible_with_drive += 1
-            else:
-                eligible_without_drive += 1
-        else:
-            record_id = record.get("id")
-            if record_id:
-                nonapproved_record_ids.append(record_id)
-
-    log(
-        f"Eligible clients with Google Drive links: "
-        f"{eligible_with_drive}/ {eligible_count}; "
-        f"without links: {eligible_without_drive}."
-    )
-
-    log(
-        "Organisation completing IA eligibility scan: "
-        f"field={STAFF_ID_FILTER_FIELD_ID}; "
-        f"field present={organisation_field_present}/{before_filter}; "
-        f"clients with linked IDs={clients_with_linked_ids}/{before_filter}; "
-        f"clients matching approved IDs={eligible_count}/{before_filter}; "
-        f"approved IDs configured={len(ALLOWED_STAFF_IDS)}."
-    )
-
-    log(
-        "NONAPPROVED IDS FROM THE SAME ELIGIBILITY SCAN: "
-        f"{len(nonapproved_record_ids)} records."
-    )
-
-    for index, record_id in enumerate(nonapproved_record_ids, start=1):
-        log(f"NONAPPROVED CLIENT {index}: {record_id}")
+        log(
+            f"SCC referral eligibility source: "
+            f"field=fldmDnlxO1FvsDGLt; "
+            f"records with a populated SCC referral value="
+            f"{scc_populated_count}/{len(records)}."
+        )
 
     if MCP_FETCH_ONLY:
         scc_eligible_count = sum(
@@ -4030,7 +3622,6 @@ async def execute_sync_pipeline(session):
         )
         return
 
-    # A live sync must never silently disable or bypass staff-ID filtering.
 
     # Filter clients before making any Trello API calls that could change cards.
     records = [
@@ -4042,7 +3633,7 @@ async def execute_sync_pipeline(session):
     )
 
     if not records:
-        log("No Airtable records passed the staff allowlist; no Trello changes were made.")
+        log("No Airtable records passed the SCC referral-date filter; no Trello changes were made.")
         return
 
     existing_cards, phone_index = load_existing_cards()
@@ -4069,7 +3660,7 @@ async def execute_sync_pipeline(session):
             first = get_field(fields, "Forename/First name(s)")
             last = get_field(fields, "Surname/Last Name(s)")
             fullname = f"{first} {last}".strip()
-            
+
             if not fullname and "fld7l03Yg7qOpECmp" in fields:
                 fullname = str(fields["fld7l03Yg7qOpECmp"]).strip()
 
@@ -4079,7 +3670,7 @@ async def execute_sync_pipeline(session):
 
             contact_phone = get_field(fields, "Contact number")
             whatsapp_phone = get_field(fields, "WhatsApp number") or contact_phone
-            
+
             # Smart fallback for bulk sync script
             if not contact_phone and not whatsapp_phone:
                 for k, val in fields.items():
@@ -4094,7 +3685,7 @@ async def execute_sync_pipeline(session):
                 log(f"Skipping {airtable_id}: no phone number", "warning")
                 continue
 
-            # Defence-in-depth: never write a record whose staff IDs are not approved.
+            # Defence-in-depth: never write a record without a valid SCC referral date.
             if not has_scc_referral(fields):
                 log(
                     f"⏭ Skipped record {airtable_id}: no valid SCC referral date is recorded",
